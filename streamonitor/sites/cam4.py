@@ -31,18 +31,28 @@ class Cam4(Bot):
             if not r['online']:
                 return Status.OFFLINE
 
-        r = self.session.get(f'https://webchat.cam4.com/requestAccess?roomname={self.username}', headers=headers)
+        try:
+            r = self.session.get(f'https://webchat.cam4.com/requestAccess?roomname={self.username}', headers=headers)
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f'Failed to request Cam4 room access: {e}')
+            return Status.UNKNOWN
         if r.status_code != 200:
             return Status.UNKNOWN
         r = r.json()
         if r.get('privateStream', False):
             return Status.PRIVATE
 
-        r = self.session.get(f'https://hu.cam4.com/rest/v1.0/profile/{self.username}/streamInfo', headers=headers)
+        try:
+            r = self.session.get(f'https://hu.cam4.com/rest/v1.0/profile/{self.username}/streamInfo', headers=headers)
+        except requests.exceptions.RequestException as e:
+            self.logger.warning(f'Failed to fetch Cam4 stream info: {e}')
+            return Status.UNKNOWN
         if r.status_code == 204:
             return Status.OFFLINE
         elif r.status_code == 200:
             self.lastInfo = r.json()
+            if not self.lastInfo.get('cdnURL'):
+                return Status.OFFLINE
             return Status.PUBLIC
 
         return Status.UNKNOWN

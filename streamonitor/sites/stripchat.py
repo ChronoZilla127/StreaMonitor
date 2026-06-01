@@ -51,7 +51,12 @@ class StripChat(RoomIdBot):
         super().__init__(username, room_id)
         self._id = None
         self.vr = False
-        self.getVideo = lambda _, url, filename: getVideoNativeHLS(self, url, filename, StripChat.m3u_decoder)
+        self.getVideo = lambda _, url, filename: getVideoNativeHLS(
+            self,
+            url,
+            filename,
+            lambda content: StripChat.m3u_decoder(content, self.logger),
+        )
 
     @classmethod
     def getInitialData(cls):
@@ -62,7 +67,7 @@ class StripChat(RoomIdBot):
         StripChat._static_data = r.json().get('static')
 
     @classmethod
-    def m3u_decoder(cls, content):
+    def m3u_decoder(cls, content, logger=None):
         _mouflon_filename = 'media.mp4'
 
         def _decode(encrypted_b64: str, key: str) -> str:
@@ -75,11 +80,21 @@ class StripChat(RoomIdBot):
 
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(content)
 
+        if pdkey is None:
+            message = 'Failed to decode StripChat HLS playlist: missing mouflon decryption key'
+            if pkey:
+                message += f' for pkey {pkey}'
+            if logger:
+                logger.error(message)
+            return None
+
         if psch == 'v1':
             _mouflon_file_attr = "#EXT-X-MOUFLON:FILE:"
         elif psch == 'v2':
             _mouflon_file_attr = "#EXT-X-MOUFLON:URI:"
         else:
+            if logger:
+                logger.error(f'Failed to decode StripChat HLS playlist: unsupported mouflon scheme {psch}')
             return None
 
         decoded = ''
@@ -133,17 +148,50 @@ class StripChat(RoomIdBot):
         return self.getWantedResolutionPlaylist(None)
 
     def getPlaylistVariants(self, url):
-        url = "https://edge-hls.{host}/hls/{id}{vr}/master/{id}{vr}{auto}.m3u8".format(
-                host='doppiocdn.' + random.choice(['org', 'com', 'net']),
-                id=self.room_id,
-                vr='_vr' if self.vr else '',
-                auto='_auto' if not self.vr else ''
-            )
-        result = self.session.get(url, headers=self.headers, cookies=self.cookies)
+        hosts = ['org', 'com', 'net']
+        random.shuffle(hosts)
+        result = None
+        attempts = []
+        status_codes = []
+        for host_suffix in hosts:
+            url = "https://edge-hls.{host}/hls/{id}{vr}/master/{id}{vr}{auto}.m3u8".format(
+                    host='doppiocdn.' + host_suffix,
+                    id=self.room_id,
+                    vr='_vr' if self.vr else '',
+                    auto='_auto' if not self.vr else ''
+                )
+            try:
+                result = self.session.get(url, headers=self.headers, cookies=self.cookies, timeout=20)
+            except requests.exceptions.RequestException as e:
+                attempts.append(f'{host_suffix}:{e}')
+                continue
+            attempts.append(f'{host_suffix}:HTTP {result.status_code}')
+            status_codes.append(result.status_code)
+            if result.status_code == 200:
+                break
+        if result is None or result.status_code != 200:
+            if status_codes and all(status_code in (404, 410) for status_code in status_codes):
+                self.sc = Status.OFFLINE
+                self.logger.warning(f'StripChat playlist is unavailable on all hosts: {", ".join(attempts)}')
+                return None
+            if status_codes and all(status_code == 403 for status_code in status_codes):
+                self.sc = Status.PRIVATE
+                self.logger.warning(f'StripChat playlist is private on all hosts: {", ".join(attempts)}')
+                return None
+            if 429 in status_codes:
+                self.sc = Status.RATELIMIT
+                self.ratelimit = True
+                self.logger.warning(f'StripChat playlist is rate limited: {", ".join(attempts)}')
+                return None
+            self.logger.error(f'Failed to fetch StripChat playlist from all hosts: {", ".join(attempts)}')
+            return None
         m3u8_doc = result.content.decode("utf-8")
         psch, pkey, pdkey = StripChat._getMouflonFromM3U(m3u8_doc)
         if pdkey is None:
-            self.log(f'Failed to get mouflon decryption key')
+            if pkey:
+                self.log(f'Failed to get mouflon decryption key for pkey {pkey}')
+            else:
+                self.log('Failed to get mouflon decryption key; playlist did not expose a pkey')
             return []
         variants = super().getPlaylistVariants(m3u_data=m3u8_doc)
         return [variant | {'url': f'{variant["url"]}{"&" if "?" in variant["url"] else "?"}psch={psch}&pkey={pkey}'}
@@ -272,8 +320,11 @@ class StripChat(RoomIdBot):
             if model_data.get('country'):
                 streamer.country = model_data.get('country', '').upper()
             status = model_data.get('status')
-            if status == "public" and model_data.get("isOnline"):
-                streamer.setStatus(Status.PUBLIC)
+            if status == "public":
+                if model_data.get("isOnline", model_data.get("isCamAvailable", True)):
+                    streamer.setStatus(Status.PUBLIC)
+                else:
+                    streamer.setStatus(Status.OFFLINE)
             elif status in cls._PRIVATE_STATUSES:
                 streamer.setStatus(Status.PRIVATE)
             elif status in cls._OFFLINE_STATUSES:

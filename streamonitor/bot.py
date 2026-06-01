@@ -5,7 +5,7 @@ from enum import Enum
 from urllib.parse import urljoin
 
 import m3u8
-from time import sleep
+from time import monotonic, sleep
 from datetime import datetime
 from threading import Thread
 
@@ -34,6 +34,7 @@ class Bot(Thread):
     sleep_on_error = 20
     sleep_on_ratelimit = 180
     long_offline_timeout = 600
+    download_retry_delay = 60
 
     headers = {
         "User-Agent": HTTP_USER_AGENT
@@ -77,6 +78,7 @@ class Bot(Thread):
         self.previous_status = None
         self.getVideo = getVideoFfmpeg
         self.stopDownload = None
+        self.next_download_attempt_at = 0
         self.recording = False
         self.video_files = []
         self.video_files_total_size = 0
@@ -166,6 +168,14 @@ class Bot(Thread):
             if self.quitting or not self.running:
                 return
 
+    def defer_download_attempt(self, delay=None):
+        if delay is None:
+            delay = self.download_retry_delay
+        self.next_download_attempt_at = max(self.next_download_attempt_at, monotonic() + delay)
+
+    def download_attempt_deferred(self):
+        return monotonic() < self.next_download_attempt_at
+
     def run(self):
         while not self.quitting:
             while not self.running and not self.quitting:
@@ -196,6 +206,11 @@ class Bot(Thread):
                     elif self.sc == Status.PUBLIC or self.sc == Status.PRIVATE:
                         offline_time = 0
                         if self.sc == Status.PUBLIC:
+                            if self.download_attempt_deferred():
+                                remaining = int(self.next_download_attempt_at - monotonic())
+                                self._sleep(max(1, min(remaining, self.sleep_on_offline)))
+                                continue
+
                             if self.cookie_update_interval > 0 and self.cookieUpdater is not None:
                                 def update_cookie():
                                     while self.sc == Status.PUBLIC and not self.quitting and self.running:
@@ -215,10 +230,23 @@ class Bot(Thread):
                                 self.logger.error('Failed to get video url')
                                 video_url = None
                             if video_url is None:
-                                self.sc = Status.ERROR
-                                self.logger.error(self.status())
-                                self._sleep(self.sleep_on_error)
+                                if self.sc == Status.PUBLIC:
+                                    self.sc = Status.ERROR
+                                    self.logger.error(self.status())
+                                    self._sleep(self.sleep_on_error)
+                                elif self.sc == Status.PRIVATE:
+                                    self.defer_download_attempt()
+                                    self._sleep(self.sleep_on_private)
+                                elif self.sc in [Status.OFFLINE, Status.LONG_OFFLINE]:
+                                    self.defer_download_attempt()
+                                    self._sleep(self.sleep_on_offline)
+                                elif self.sc == Status.RATELIMIT:
+                                    self.defer_download_attempt(self.sleep_on_ratelimit)
+                                    self._sleep(self.sleep_on_ratelimit)
+                                else:
+                                    self._sleep(self.sleep_on_error)
                                 continue
+                            self.next_download_attempt_at = 0
                             self.log('Started downloading show')
                             self.recording = True
                             file = self.genOutFilename()
@@ -228,10 +256,25 @@ class Bot(Thread):
                                 self.logger.exception(e)
                                 ret = False
                             if not ret:
-                                self.log('Recording ended with error')
-                                self.sc = Status.ERROR
-                                self.log(self.status())
-                                self._sleep(self.sleep_on_error)
+                                self.recording = False
+                                if self.sc == Status.PUBLIC:
+                                    self.log('Recording ended with error')
+                                    self.sc = Status.ERROR
+                                    self.log(self.status())
+                                    self._sleep(self.sleep_on_error)
+                                else:
+                                    self.log('Recording ended')
+                                    if self.sc == Status.PRIVATE:
+                                        self.defer_download_attempt()
+                                        self._sleep(self.sleep_on_private)
+                                    elif self.sc in [Status.OFFLINE, Status.LONG_OFFLINE]:
+                                        self.defer_download_attempt()
+                                        self._sleep(self.sleep_on_offline)
+                                    elif self.sc == Status.RATELIMIT:
+                                        self.defer_download_attempt(self.sleep_on_ratelimit)
+                                        self._sleep(self.sleep_on_ratelimit)
+                                    else:
+                                        self._sleep(self.sleep_on_error)
                                 continue
                             self.recording = False
                             self.log('Recording ended')
@@ -269,7 +312,28 @@ class Bot(Thread):
     def setStatus(self, sc):
         if self.sc == Status.LONG_OFFLINE and sc == Status.OFFLINE:
             return
+        if sc == Status.PUBLIC and self.download_attempt_deferred():
+            return
         self.sc = sc
+
+    @staticmethod
+    def _add_missing_bandwidth_to_playlist(m3u8_doc):
+        lines = []
+        for line in m3u8_doc.splitlines():
+            if line.startswith('#EXT-X-STREAM-INF:') and 'BANDWIDTH=' not in line.upper():
+                separator = '' if line.endswith(':') else ','
+                line = f'{line}{separator}BANDWIDTH=0'
+            lines.append(line)
+        return '\n'.join(lines)
+
+    @classmethod
+    def _load_m3u8(cls, m3u8_doc):
+        try:
+            return m3u8.loads(m3u8_doc)
+        except KeyError as e:
+            if e.args and e.args[0] == 'bandwidth':
+                return m3u8.loads(cls._add_missing_bandwidth_to_playlist(m3u8_doc))
+            raise
 
     def getPlaylistVariants(self, url=None, m3u_data=None):
         sources = []
@@ -277,13 +341,28 @@ class Bot(Thread):
         if isinstance(m3u_data, m3u8.M3U8):
             variant_m3u8 = m3u_data
         elif isinstance(m3u_data, str):
-            variant_m3u8 = m3u8.loads(m3u_data)
+            variant_m3u8 = self._load_m3u8(m3u_data)
         elif not m3u_data or url:
-            result = self.session.get(url, headers=self.headers, cookies=self.cookies)
+            try:
+                result = self.session.get(url, headers=self.headers, cookies=self.cookies, timeout=20)
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f'Failed to fetch playlist: {e}')
+                return None
+            if result.status_code != 200:
+                self.logger.error(f'Failed to fetch playlist: HTTP {result.status_code}')
+                return None
             m3u8_doc = result.content.decode("utf-8")
-            variant_m3u8 = m3u8.loads(m3u8_doc)
+            variant_m3u8 = self._load_m3u8(m3u8_doc)
         else:
             return sources
+
+        if url and not variant_m3u8.is_variant and len(variant_m3u8.segments) > 0:
+            return [{
+                'url': url,
+                'resolution': (0, 0),
+                'frame_rate': None,
+                'bandwidth': None
+            }]
 
         for playlist in variant_m3u8.playlists:
             stream_info = playlist.stream_info
