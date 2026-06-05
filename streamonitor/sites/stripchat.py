@@ -313,7 +313,7 @@ class StripChat(RoomIdBot):
         for model_id, streamer in model_ids.items():
             model_data = data_map.get(model_id)
             if not model_data:
-                streamer.setStatus(Status.UNKNOWN)
+                streamer.setStatus(Status.OFFLINE)
                 continue
             if model_data.get('gender'):
                 streamer.gender = cls._GENDER_MAP.get(model_data.get('gender'))

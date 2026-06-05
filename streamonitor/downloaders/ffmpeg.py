@@ -8,6 +8,26 @@ from threading import Thread
 from parameters import DEBUG, SEGMENT_TIME, CONTAINER, FFMPEG_PATH, FFMPEG_READRATE
 
 
+def _tail_file(path, max_lines=20):
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536), os.SEEK_SET)
+            output = f.read().decode(errors='replace').strip()
+    except OSError:
+        return ''
+    if not output:
+        return ''
+    return '\n'.join(output.splitlines()[-max_lines:])
+
+
+def _format_return_code(returncode):
+    if returncode > 0x7fffffff:
+        return f'{returncode} ({returncode - 0x100000000})'
+    return str(returncode)
+
+
 def getVideoFfmpeg(self, url, filename):
     cmd = [
         FFMPEG_PATH,
@@ -66,8 +86,11 @@ def getVideoFfmpeg(self, url, filename):
 
     def execute():
         nonlocal error
+        stderr_path = filename + '.stderr.log'
+        stderr = None
+        process = None
         try:
-            stderr = open(filename + '.stderr.log', 'w+') if DEBUG else subprocess.DEVNULL
+            stderr = open(stderr_path, 'wb')
             startupinfo = None
             if sys.platform == "win32":
                 startupinfo = subprocess.STARTUPINFO()
@@ -83,6 +106,9 @@ def getVideoFfmpeg(self, url, filename):
                 self.logger.error("Got OSError, errno: " + str(e.errno))
                 error = True
                 return
+        finally:
+            if process is None and stderr is not None:
+                stderr.close()
 
         while process.poll() is None:
             if stopping.stop:
@@ -93,10 +119,30 @@ def getVideoFfmpeg(self, url, filename):
             except subprocess.TimeoutExpired:
                 pass
 
+        if stderr is not None:
+            stderr.close()
+
         if process.returncode and process.returncode != 0 and process.returncode != 255:
-            self.logger.error('The process exited with an error. Return code: ' + str(process.returncode))
+            details = _tail_file(stderr_path)
+            return_code = _format_return_code(process.returncode)
+            if details:
+                self.logger.error(
+                    f'The process exited with an error. Return code: {return_code}\n{details}'
+                )
+            elif DEBUG:
+                self.logger.error(
+                    f'The process exited with an error. Return code: {return_code}. See {stderr_path}'
+                )
+            else:
+                self.logger.error('The process exited with an error. Return code: ' + return_code)
             error = True
             return
+
+        if not DEBUG:
+            try:
+                os.remove(stderr_path)
+            except OSError:
+                pass
 
     thread = Thread(target=execute)
     thread.start()

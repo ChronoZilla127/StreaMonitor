@@ -35,6 +35,102 @@ def _tail_output(output, max_lines=20):
     return '\n'.join(output.splitlines()[-max_lines:])
 
 
+def _read_u32(data, offset):
+    return int.from_bytes(data[offset:offset + 4], 'big')
+
+
+def _read_u64(data, offset):
+    return int.from_bytes(data[offset:offset + 8], 'big')
+
+
+def _iter_mp4_boxes(data, start=0, end=None):
+    end = len(data) if end is None else min(end, len(data))
+    offset = start
+    while offset + 8 <= end:
+        size = _read_u32(data, offset)
+        box_type = data[offset + 4:offset + 8]
+        header_size = 8
+
+        if size == 1:
+            if offset + 16 > end:
+                return
+            size = _read_u64(data, offset + 8)
+            header_size = 16
+        elif size == 0:
+            size = end - offset
+
+        if size < header_size or offset + size > end:
+            return
+
+        yield box_type, offset, header_size, size
+        offset += size
+
+
+def _find_zero_sized_trun_sample(data, start=0, end=None):
+    for box_type, offset, header_size, size in _iter_mp4_boxes(data, start, end):
+        payload_start = offset + header_size
+        payload_end = offset + size
+
+        if box_type in (b'moof', b'traf'):
+            if _find_zero_sized_trun_sample(data, payload_start, payload_end):
+                return True
+            continue
+
+        if box_type != b'trun' or payload_start + 8 > payload_end:
+            continue
+
+        flags = int.from_bytes(data[payload_start + 1:payload_start + 4], 'big')
+        sample_count = _read_u32(data, payload_start + 4)
+        cursor = payload_start + 8
+
+        if flags & 0x000001:
+            cursor += 4
+        if flags & 0x000004:
+            cursor += 4
+
+        has_sample_duration = bool(flags & 0x000100)
+        has_sample_size = bool(flags & 0x000200)
+        has_sample_flags = bool(flags & 0x000400)
+        has_composition_time_offset = bool(flags & 0x000800)
+
+        if not has_sample_size:
+            continue
+
+        for _ in range(sample_count):
+            if has_sample_duration:
+                cursor += 4
+            if cursor + 4 > payload_end:
+                return True
+            sample_size = _read_u32(data, cursor)
+            cursor += 4
+            if sample_size == 0:
+                return True
+            if has_sample_flags:
+                cursor += 4
+            if has_composition_time_offset:
+                cursor += 4
+            if cursor > payload_end:
+                return True
+
+    return False
+
+
+def _invalid_fmp4_fragment_reason(data):
+    if len(data) < 8 or data[4:8] not in (b'ftyp', b'styp', b'sidx', b'moof'):
+        return None
+    if _find_zero_sized_trun_sample(data):
+        return 'zero-sized sample in fMP4 fragment'
+    return None
+
+
+def _ffmpeg_failed_on_partial_hls(details):
+    details = details.lower()
+    return (
+        'invalid data found when processing input' in details
+        or 'error reading header' in details
+    )
+
+
 def getVideoNativeHLS(self, url, filename, m3u_processor=None):
     self.stopDownloadFlag = False
     error = False
@@ -157,6 +253,13 @@ def getVideoNativeHLS(self, url, filename, m3u_processor=None):
                             self.logger.error(f'Failed to download HLS segment {chunk_uri}: HTTP {m.status_code}')
                             error = True
                             return
+                        invalid_fragment_reason = _invalid_fmp4_fragment_reason(m.content)
+                        if invalid_fragment_reason:
+                            end_as_transient(
+                                outfile,
+                                f'HLS segment contains invalid fMP4 data ({invalid_fragment_reason}): {chunk_uri}',
+                            )
+                            return
                         outfile.write(m.content)
                         if self.stopDownloadFlag:
                             return
@@ -213,6 +316,12 @@ def getVideoNativeHLS(self, url, filename, m3u_processor=None):
     except FFRuntimeError as e:
         if e.exit_code and e.exit_code != 255:
             details = _tail_output(e.stderr)
+            if ended_transiently and details and _ffmpeg_failed_on_partial_hls(details):
+                self.logger.warning(
+                    'FFmpeg could not remux the partial HLS data after the stream ended; '
+                    f'keeping temp file for inspection: {tmpfilename}\n{details}'
+                )
+                return False
             if details:
                 self.logger.error(f'FFmpeg post-processing failed with exit code {e.exit_code}:\n{details}')
             elif DEBUG:
