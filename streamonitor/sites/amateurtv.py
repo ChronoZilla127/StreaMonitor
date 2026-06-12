@@ -1,3 +1,5 @@
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
 import requests
 from streamonitor.bot import Bot
 from streamonitor.enums import Status
@@ -7,13 +9,45 @@ class AmateurTV(Bot):
     site = 'AmateurTV'
     siteslug = 'ATV'
 
+    @staticmethod
+    def _append_variant(url, height):
+        parts = urlsplit(url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query['variant'] = str(height)
+        return urlunsplit(parts._replace(query=urlencode(query)))
+
+    def getWebsiteURL(self):
+        return f'https://www.amateur.tv/model/{self.username}'
+
     def getPlaylistVariants(self, url):
         sources = []
-        for resolution in self.lastInfo['qualities']:
-            width, height = resolution.split('x')
+
+        video_technologies = self.lastInfo.get('videoTechnologies') or {}
+        hls_url = video_technologies.get('fmp4-hls')
+        if not hls_url:
+            self.logger.error('ATV response did not include an fMP4 HLS playlist URL')
+            return None
+
+        for resolution in self.lastInfo.get('qualities') or []:
+            try:
+                width, height = resolution.split('x', maxsplit=1)
+                width = int(width)
+                height = int(height)
+            except (TypeError, ValueError):
+                self.logger.warning(f'Ignoring invalid ATV resolution: {resolution}')
+                continue
+
             sources.append({
-                'url': f"{self.lastInfo['videoTechnologies']['fmp4']}&variant={height}",
-                'resolution': (int(width), int(height)),
+                'url': self._append_variant(hls_url, height),
+                'resolution': (width, height),
+                'frame_rate': None,
+                'bandwidth': None
+            })
+
+        if len(sources) == 0:
+            sources.append({
+                'url': hls_url,
+                'resolution': (0, 0),
                 'frame_rate': None,
                 'bandwidth': None
             })
