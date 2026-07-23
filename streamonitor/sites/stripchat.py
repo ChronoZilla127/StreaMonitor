@@ -147,7 +147,7 @@ class StripChat(RoomIdBot):
     def getVideoUrl(self):
         return self.getWantedResolutionPlaylist(None)
 
-    def getPlaylistVariants(self, url):
+    def getPlaylistVariants(self, url=None, m3u_data=None):
         hosts = ['org', 'com', 'net']
         random.shuffle(hosts)
         result = None

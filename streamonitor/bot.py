@@ -379,9 +379,9 @@ class Bot(Thread):
             return None
         return sources  # [(url, (width, height)),...]
 
-    def getWantedResolutionPlaylist(self, url):
+    def getWantedResolutionPlaylist(self, url, m3u_data=None):
         try:
-            sources = self.getPlaylistVariants(url)
+            sources = self.getPlaylistVariants(url, m3u_data=m3u_data)
             if sources is None:
                 return None
 

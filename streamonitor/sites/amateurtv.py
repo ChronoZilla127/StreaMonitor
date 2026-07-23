@@ -19,7 +19,7 @@ class AmateurTV(Bot):
     def getWebsiteURL(self):
         return f'https://www.amateur.tv/model/{self.username}'
 
-    def getPlaylistVariants(self, url):
+    def getPlaylistVariants(self, url, m3u_data=None):
         sources = []
 
         video_technologies = self.lastInfo.get('videoTechnologies') or {}

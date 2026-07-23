@@ -11,7 +11,7 @@ class StreaMate(Bot):
     def getWebsiteURL(self):
         return "https://streamate.com/cam/" + self.username
 
-    def getPlaylistVariants(self, url):
+    def getPlaylistVariants(self, url, m3u_data=None):
         sources = []
         # formats: mp4-rtmp, mp4-hls, mp4-ws
         for source in self.lastInfo['formats']['mp4-hls']['encodings']:
