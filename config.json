@@ -325,8 +325,47 @@
         "site": "StripChat",
         "username": "chirlleyy",
         "running": true,
+        "country": "CO",
+        "gender": 1,
+        "room_id": "65899400"
+    },
+    {
+        "site": "XLoveCam",
+        "username": "poisonllizzy",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "StripChat",
+        "username": "Candy-Desire",
+        "running": true,
+        "country": "FR",
+        "gender": 1,
+        "room_id": "151114829"
+    },
+    {
+        "site": "StripChat",
+        "username": "Chiara_Bond",
+        "running": true,
+        "country": "ES",
+        "gender": 1,
+        "room_id": "270465692"
+    },
+    {
+        "site": "StripChat",
+        "username": "Fruttitas",
+        "running": true,
+        "country": "CL",
+        "gender": 1,
+        "room_id": "170913991"
+    },
+    {
+        "site": "StripChat",
+        "username": "Indiaiset",
+        "running": true,
         "country": null,
         "gender": null,
-        "room_id": "65899400"
+        "room_id": "265375381"
     }
 ]

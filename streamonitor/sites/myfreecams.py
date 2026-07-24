@@ -12,6 +12,8 @@ from streamonitor.enums import Status
 class MyFreeCams(Bot):
     site = 'MyFreeCams'
     siteslug = 'MFC'
+    status_request_attempts = 3
+    status_request_timeout = (10, 20)
 
     def __init__(self, username):
         super().__init__(username)
@@ -51,7 +53,25 @@ class MyFreeCams(Bot):
         return self.getWantedResolutionPlaylist(playlist_url, m3u_data=r.text)
 
     def getStatus(self):
-        r = self.session.get(f'https://share.myfreecams.com/{self.username}')
+        url = f'https://share.myfreecams.com/{self.username}'
+        for attempt in range(1, self.status_request_attempts + 1):
+            try:
+                r = self.session.get(url, timeout=self.status_request_timeout)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == self.status_request_attempts:
+                    self.logger.warning(
+                        f'MFC status request failed after {attempt} attempts: {e}'
+                    )
+                    return Status.UNKNOWN
+
+                delay = 2 ** (attempt - 1)
+                self.logger.warning(
+                    f'MFC status request failed (attempt {attempt}/'
+                    f'{self.status_request_attempts}); retrying in {delay}s: {e}'
+                )
+                self._sleep(delay)
+
         if r.status_code == 404:
             return Status.NOTEXIST
         if r.status_code != 200:

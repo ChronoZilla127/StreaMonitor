@@ -17,6 +17,8 @@ class StripChat(RoomIdBot):
     siteslug = 'SC'
 
     bulk_update = True
+    status_request_attempts = 3
+    status_request_timeout = (10, 20)
     _static_data = None
     _mouflon_cache_filename = 'stripchat_mouflon_keys.json'
     _mouflon_keys: dict = None
@@ -204,10 +206,34 @@ class StripChat(RoomIdBot):
         return ''.join(random.choice(chars) for _ in range(length))
 
     def _getStatusData(self, username):
-        r = self.session.get(
-            f'https://stripchat.com/api/front/v2/models/username/{username}/cam?uniq={StripChat.uniq()}',
-            headers=self.headers
-        )
+        url = f'https://stripchat.com/api/front/v2/models/username/{username}/cam'
+        for attempt in range(1, self.status_request_attempts + 1):
+            try:
+                r = self.session.get(
+                    f'{url}?uniq={StripChat.uniq()}',
+                    headers=self.headers,
+                    timeout=self.status_request_timeout
+                )
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == self.status_request_attempts:
+                    self.logger.warning(
+                        f'StripChat status request failed after {attempt} attempts: {e}'
+                    )
+                    return None
+
+                delay = 2 ** (attempt - 1)
+                self.logger.warning(
+                    f'StripChat status request failed (attempt {attempt}/'
+                    f'{self.status_request_attempts}); retrying in {delay}s: {e}'
+                )
+                session_headers = self.session.headers.copy()
+                session_cookies = self.session.cookies.copy()
+                self.session.close()
+                self.session = requests.Session()
+                self.session.headers.update(session_headers)
+                self.session.cookies.update(session_cookies)
+                self._sleep(delay)
 
         try:
             data = r.json()
@@ -240,7 +266,7 @@ class StripChat(RoomIdBot):
         if username == self.username:
             self._update_lastInfo(data)
 
-        if 'user' not in data:
+        if not data or 'user' not in data:
             return None
         if 'user' not in data['user']:
             return None
