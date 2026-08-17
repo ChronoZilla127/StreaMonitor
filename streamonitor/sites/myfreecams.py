@@ -73,25 +73,44 @@ class MyFreeCams(Bot):
                 self._sleep(delay)
 
         if r.status_code == 404:
-            return Status.NOTEXIST
+            # The MFC share endpoint also returns 404 for existing models while
+            # they are offline, so this response cannot prove nonexistence.
+            self.attrs = {}
+            self.videoUrl = None
+            return Status.OFFLINE
         if r.status_code != 200:
             return Status.UNKNOWN
+
         doc = r.content
+        parsed_doc = BeautifulSoup(doc, 'html.parser')
+        params = parsed_doc.find(class_='campreview')
+
+        # Offline model pages do not necessarily include the tracking URL or a
+        # model_id. Their absence does not mean that the account does not exist;
+        # it only means there is no public preview to record.
+        if not params:
+            self.attrs = {}
+            self.videoUrl = None
+            return Status.OFFLINE
+
         startpos = doc.find(b'https://www.myfreecams.com/php/tracking.php?')
+        if startpos < 0:
+            self.logger.warning('MFC preview page is missing its tracking URL')
+            return Status.UNKNOWN
+
         endpos = doc.find(b'"', startpos)
+        if endpos < 0:
+            self.logger.warning('MFC preview page has an invalid tracking URL')
+            return Status.UNKNOWN
+
         url = urllib.parse.urlparse(doc[startpos:endpos])
         qs = urllib.parse.parse_qs(url.query)
         if b'model_id' not in qs:
-            return Status.NOTEXIST
+            self.logger.warning('MFC preview page is missing model_id')
+            return Status.UNKNOWN
 
-        doc = BeautifulSoup(doc, 'html.parser')
-        params = doc.find(class_='campreview')
-        if params:
-            self.attrs = params.attrs
-            self.videoUrl = self.getVideoUrl(refresh=True)
-            if self.videoUrl:
-                return Status.PUBLIC
-            else:
-                return Status.PRIVATE
-        else:
-            return Status.OFFLINE
+        self.attrs = params.attrs
+        self.videoUrl = self.getVideoUrl(refresh=True)
+        if self.videoUrl:
+            return Status.PUBLIC
+        return Status.PRIVATE

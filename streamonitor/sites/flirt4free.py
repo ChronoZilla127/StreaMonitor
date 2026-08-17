@@ -1,4 +1,5 @@
 import json
+import re
 from contextlib import closing
 from urllib.parse import quote, urljoin
 
@@ -60,6 +61,14 @@ class Flirt4Free(RoomIdBot):
 
         if username in Flirt4Free.models:
             return Flirt4Free.models[username]['model_id']
+
+        r = self.session.get(
+            f'https://www.flirt4free.com/models/bios/{username}/about.php'
+        )
+        if r.status_code == 200:
+            match = re.search(r"listsModelId\s*=\s*['\"](\d+)['\"]", r.text)
+            if match:
+                return match.group(1)
         return None
 
     def getVideoUrl(self):
@@ -315,7 +324,7 @@ class Flirt4Free(RoomIdBot):
 
         self.lastInfo = {'room': room_info}
         if room_info.get('message') == 'Invalid Model':
-            return Status.NOTEXIST
+            return Status.OFFLINE
         if 'config' not in room_info:
             return Status.OFFLINE
 
