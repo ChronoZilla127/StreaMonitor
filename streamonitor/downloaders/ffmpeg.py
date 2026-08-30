@@ -47,6 +47,22 @@ def getVideoFfmpeg(self, url, filename):
     if FFMPEG_READRATE:
         cmd.extend(['-readrate', f'{FFMPEG_READRATE!s}'])
 
+    allowed_extensions = getattr(self, 'ffmpeg_allowed_extensions', None)
+    if allowed_extensions:
+        cmd.extend(['-allowed_extensions', allowed_extensions])
+
+    allowed_segment_extensions = getattr(
+        self, 'ffmpeg_allowed_segment_extensions', None
+    )
+    if allowed_segment_extensions:
+        cmd.extend([
+            '-allowed_segment_extensions', allowed_segment_extensions
+        ])
+
+    extension_picky = getattr(self, 'ffmpeg_extension_picky', None)
+    if extension_picky is not None:
+        cmd.extend(['-extension_picky', str(int(extension_picky))])
+
     cmd.extend([
         '-max_reload', '20',
         '-seg_max_retry', '20',

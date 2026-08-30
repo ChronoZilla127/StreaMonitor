@@ -1,9 +1,11 @@
+import json
+import random
+import re
+import time
 import urllib.parse
-import warnings
 
 import requests
-from bs4 import BeautifulSoup
-from urllib3.exceptions import InsecureRequestWarning
+import websocket
 
 from streamonitor.bot import Bot
 from streamonitor.enums import Status
@@ -12,105 +14,188 @@ from streamonitor.enums import Status
 class MyFreeCams(Bot):
     site = 'MyFreeCams'
     siteslug = 'MFC'
-    status_request_attempts = 3
-    status_request_timeout = (10, 20)
+    ffmpeg_allowed_extensions = 'ALL'
+    ffmpeg_allowed_segment_extensions = 'ALL'
+    ffmpeg_extension_picky = False
+    server_config_url = 'https://www.myfreecams.com/_js/serverconfig.js'
+    fcs_timeout = 15
+    _server_config = None
+    _server_config_time = 0
 
     def __init__(self, username):
         super().__init__(username)
-        self.attrs = {}
         self.videoUrl = None
+        self.model_info = None
 
     def getWebsiteURL(self):
-        return "https://www.myfreecams.com/#" + self.username
+        return 'https://www.myfreecams.com/#' + self.username
+
+    def _get_server_config(self):
+        cls = self.__class__
+        if cls._server_config and time.time() - cls._server_config_time < 3600:
+            return cls._server_config
+        try:
+            response = self.session.get(
+                self.server_config_url,
+                headers={'Referer': 'https://www.myfreecams.com/'},
+                timeout=(10, 20),
+            )
+            response.raise_for_status()
+            match = re.search(r'\{.*\}', response.text, re.DOTALL)
+            if not match:
+                raise ValueError('serverconfig does not contain JSON')
+            cls._server_config = json.loads(match.group(0))
+            cls._server_config_time = time.time()
+        except (requests.RequestException, ValueError, json.JSONDecodeError) as e:
+            self.logger.warning(f'Failed to fetch MFC server configuration: {e}')
+        return cls._server_config
+
+    @staticmethod
+    def _frames(buffer):
+        frames = []
+        offset = 0
+        while len(buffer) - offset >= 6 and buffer[offset:offset + 6].strip().isdigit():
+            length = int(buffer[offset:offset + 6])
+            end = offset + 6 + length
+            if len(buffer) < end:
+                break
+            parts = buffer[offset + 6:end].split(' ', 5)
+            if len(parts) >= 5 and parts[0].isdigit():
+                frames.append((int(parts[0]), parts[5] if len(parts) > 5 else ''))
+            offset = end
+        return frames, buffer[offset:]
+
+    def _lookup_model(self):
+        config = self._get_server_config()
+        if not config:
+            return None
+        servers = [
+            host for host, protocol in (config.get('websocket_servers') or {}).items()
+            if protocol == 'rfc6455'
+        ]
+        random.shuffle(servers)
+        for host in servers[:2]:
+            ws = None
+            try:
+                ws = websocket.create_connection(
+                    f'wss://{host}.myfreecams.com/fcsl',
+                    timeout=self.fcs_timeout,
+                    origin='https://www.myfreecams.com',
+                )
+                ws.send('hello fcserver\n\0')
+                ws.send(
+                    f'1 0 0 20071025 0 '
+                    f'{random.randint(10_000_000, 99_999_999)}@guest:guest\n'
+                )
+                ws.send(f'10 0 0 20 0 {self.username.lower()}\n')
+                buffer = ''
+                deadline = time.time() + self.fcs_timeout
+                while time.time() < deadline:
+                    incoming = ws.recv()
+                    if isinstance(incoming, bytes):
+                        incoming = incoming.decode('utf-8', 'replace')
+                    buffer += incoming or ''
+                    frames, buffer = self._frames(buffer)
+                    for message_type, payload in frames:
+                        if message_type != 10:
+                            continue
+                        decoded = urllib.parse.unquote(payload).strip()
+                        if not decoded.startswith('{'):
+                            return {}
+                        user = json.loads(decoded)
+                        if user.get('lv') != 4:
+                            return {}
+                        return {
+                            'uid': user.get('uid'),
+                            'vs': user.get('vs'),
+                            'camserv': (user.get('u') or {}).get('camserv'),
+                        }
+            except (OSError, ValueError, json.JSONDecodeError, websocket.WebSocketException) as e:
+                self.logger.warning(f'MFC websocket lookup failed on {host}: {e}')
+            finally:
+                if ws:
+                    ws.close()
+        return None
+
+    @staticmethod
+    def _server_candidates(config, camserv):
+        key = str(camserv) if camserv is not None else ''
+        result = []
+        for mapping, prefix in (
+            ('h5video_servers', 'mfc_'),
+            ('ngvideo_servers', 'mfc_'),
+            ('wzobs_servers', 'mfc_a_'),
+        ):
+            name = (config.get(mapping) or {}).get(key, '')
+            match = re.search(r'(\d+)$', name)
+            if match:
+                result.append((int(match.group(1)), prefix))
+        if not result and key.isdigit():
+            number = int(key)
+            if number >= 3000:
+                number -= 1000
+            elif number >= 1690:
+                number -= 700
+            elif number > 500:
+                number -= 500
+            result.append((number, 'mfc_'))
+        return list(dict.fromkeys(result))
+
+    def _playlist_candidates(self):
+        if not self.model_info or not self.model_info.get('uid'):
+            return []
+        room = int(self.model_info['uid']) + 100_000_000
+        config = self._get_server_config() or {}
+        urls = []
+        for server, preferred in self._server_candidates(
+            config, self.model_info.get('camserv')
+        ):
+            alternate = 'mfc_a_' if preferred == 'mfc_' else 'mfc_'
+            for prefix in (preferred, alternate):
+                urls.append(
+                    'https://edgevideo.myfreecams.com/llhls/NxServer/'
+                    f'{server}/ngrp:{prefix}{room}.f4v_cmaf/playlist_sfm4s.m3u8'
+                )
+                urls.append(
+                    'https://edgevideo.myfreecams.com/hls/NxServer/'
+                    f'{server}/ngrp:{prefix}{room}.f4v_mobile/playlist.m3u8'
+                )
+        return urls
 
     def getVideoUrl(self, refresh=False):
         if not refresh:
             return self.videoUrl
-
-        if 'data-cam-preview-model-id-value' not in self.attrs:
+        if not self.model_info or self.model_info.get('vs') != 0:
             return None
-
-        sid = self.attrs['data-cam-preview-server-id-value']
-        mid = 100000000 + int(self.attrs['data-cam-preview-model-id-value'])
-        a = 'a_' if self.attrs['data-cam-preview-is-wzobs-value'] == 'true' else ''
-        playlist_url = f"https://previews.myfreecams.com/hls/NxServer/{sid}/ngrp:mfc_{a}{mid}.f4v_mobile_mhp1080_previewurl/playlist.m3u8"
-        try:
-            r = self.session.get(playlist_url, timeout=20)
-        except requests.exceptions.SSLError:
+        for url in self._playlist_candidates():
             try:
-                # MFC preview CDN can serve an expired certificate; keep the bypass scoped here.
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore', InsecureRequestWarning)
-                    r = self.session.get(playlist_url, timeout=20, verify=False)
-            except requests.exceptions.RequestException as e:
-                self.logger.warning(f'Failed to fetch MFC preview playlist: {e}')
-                return None
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(f'Failed to fetch MFC preview playlist: {e}')
-            return None
-        if r.status_code != 200:
-            return None
-        return self.getWantedResolutionPlaylist(playlist_url, m3u_data=r.text)
+                response = self.session.get(
+                    url,
+                    headers={'Referer': 'https://www.myfreecams.com/'},
+                    timeout=15,
+                )
+            except requests.RequestException:
+                continue
+            if response.status_code == 200 and '#EXTM3U' in response.text[:128]:
+                selected = self.getWantedResolutionPlaylist(url, m3u_data=response.text)
+                if selected:
+                    return selected
+        return None
 
     def getStatus(self):
-        url = f'https://share.myfreecams.com/{self.username}'
-        for attempt in range(1, self.status_request_attempts + 1):
-            try:
-                r = self.session.get(url, timeout=self.status_request_timeout)
-                break
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                if attempt == self.status_request_attempts:
-                    self.logger.warning(
-                        f'MFC status request failed after {attempt} attempts: {e}'
-                    )
-                    return Status.UNKNOWN
-
-                delay = 2 ** (attempt - 1)
-                self.logger.warning(
-                    f'MFC status request failed (attempt {attempt}/'
-                    f'{self.status_request_attempts}); retrying in {delay}s: {e}'
-                )
-                self._sleep(delay)
-
-        if r.status_code == 404:
-            # The MFC share endpoint also returns 404 for existing models while
-            # they are offline, so this response cannot prove nonexistence.
-            self.attrs = {}
+        info = self._lookup_model()
+        if info is None:
+            return Status.UNKNOWN
+        if not info:
+            self.model_info = None
             self.videoUrl = None
-            return Status.OFFLINE
-        if r.status_code != 200:
-            return Status.UNKNOWN
-
-        doc = r.content
-        parsed_doc = BeautifulSoup(doc, 'html.parser')
-        params = parsed_doc.find(class_='campreview')
-
-        # Offline model pages do not necessarily include the tracking URL or a
-        # model_id. Their absence does not mean that the account does not exist;
-        # it only means there is no public preview to record.
-        if not params:
-            self.attrs = {}
-            self.videoUrl = None
-            return Status.OFFLINE
-
-        startpos = doc.find(b'https://www.myfreecams.com/php/tracking.php?')
-        if startpos < 0:
-            self.logger.warning('MFC preview page is missing its tracking URL')
-            return Status.UNKNOWN
-
-        endpos = doc.find(b'"', startpos)
-        if endpos < 0:
-            self.logger.warning('MFC preview page has an invalid tracking URL')
-            return Status.UNKNOWN
-
-        url = urllib.parse.urlparse(doc[startpos:endpos])
-        qs = urllib.parse.parse_qs(url.query)
-        if b'model_id' not in qs:
-            self.logger.warning('MFC preview page is missing model_id')
-            return Status.UNKNOWN
-
-        self.attrs = params.attrs
-        self.videoUrl = self.getVideoUrl(refresh=True)
-        if self.videoUrl:
-            return Status.PUBLIC
-        return Status.PRIVATE
+            return Status.NOTEXIST
+        self.model_info = info
+        state = info.get('vs')
+        if state == 0:
+            self.videoUrl = self.getVideoUrl(refresh=True)
+            return Status.PUBLIC if self.videoUrl else Status.UNKNOWN
+        self.videoUrl = None
+        if state in (12, 13, 14):
+            return Status.PRIVATE
+        return Status.OFFLINE

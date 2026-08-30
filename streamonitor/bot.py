@@ -27,6 +27,9 @@ class Bot(Thread):
     aliases = []
     ratelimit = False
     bulk_update = False
+    ffmpeg_allowed_extensions = None
+    ffmpeg_allowed_segment_extensions = None
+    ffmpeg_extension_picky = None
 
     sleep_on_private = 5
     sleep_on_offline = 5
