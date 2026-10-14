@@ -7,6 +7,12 @@ class CamSoda(Bot):
     site = 'CamSoda'
     siteslug = 'CS'
 
+    # CamSoda HLS segment URLs can lack a standard media extension.
+    # Allow them through FFmpeg's HLS extension checks.
+    ffmpeg_allowed_extensions = 'ALL'
+    ffmpeg_allowed_segment_extensions = 'ALL'
+    ffmpeg_extension_picky = False
+
     def getWebsiteURL(self):
         return "https://www.camsoda.com/" + self.username
 

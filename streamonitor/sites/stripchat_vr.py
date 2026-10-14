@@ -7,6 +7,7 @@ class StripChatVR(StripChat):
     site = 'StripChatVR'
     siteslug = 'SCVR'
     bulk_update = False
+    sleep_on_long_offline = 10
 
     vr_frame_format_map = {
         'FISHEYE': 'F',

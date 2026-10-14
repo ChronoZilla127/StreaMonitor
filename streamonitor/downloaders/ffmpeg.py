@@ -34,6 +34,10 @@ def getVideoFfmpeg(self, url, filename):
         '-user_agent', self.headers['User-Agent']
     ]
 
+    referer = getattr(self, 'ffmpeg_referer', None)
+    if referer:
+        cmd.extend(['-referer', referer])
+
     if type(self.cookies) is requests.cookies.RequestsCookieJar:
         cookies_text = ''
         for cookie in self.cookies:
@@ -140,6 +144,10 @@ def getVideoFfmpeg(self, url, filename):
 
         if process.returncode and process.returncode != 0 and process.returncode != 255:
             details = _tail_file(stderr_path)
+            error = True
+            error_handler = getattr(self, 'handle_ffmpeg_error', None)
+            if error_handler and error_handler(details):
+                return
             return_code = _format_return_code(process.returncode)
             if details:
                 self.logger.error(
