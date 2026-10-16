@@ -48,8 +48,10 @@ def getVideoFfmpeg(self, url, filename):
             '-cookies', cookies_text
         ])
 
-    if FFMPEG_READRATE:
+    if FFMPEG_READRATE and not getattr(self, 'ffmpeg_disable_readrate', False):
         cmd.extend(['-readrate', f'{FFMPEG_READRATE!s}'])
+    if getattr(self, 'ffmpeg_copy_timestamps', False):
+        cmd.extend(['-copyts', '-start_at_zero'])
 
     allowed_extensions = getattr(self, 'ffmpeg_allowed_extensions', None)
     if allowed_extensions:
@@ -75,6 +77,8 @@ def getVideoFfmpeg(self, url, filename):
         '-c:a', 'copy',
         '-c:v', 'copy',
     ])
+    for stream in getattr(self, 'ffmpeg_output_maps', None) or ():
+        cmd.extend(['-map', stream])
 
     suffix = ''
     if hasattr(self, 'filename_extra_suffix'):
@@ -130,7 +134,37 @@ def getVideoFfmpeg(self, url, filename):
             if process is None and stderr is not None:
                 stderr.close()
 
+        recording_error = getattr(self, 'ffmpeg_recording_error', None)
+        recording_failure = None
+        log_position = 0
+        pending_log = ''
+
+        def check_recording():
+            nonlocal log_position, pending_log
+            if not recording_error:
+                return None
+            try:
+                with open(stderr_path, 'rb') as output:
+                    output.seek(log_position)
+                    content = output.read()
+                    log_position = output.tell()
+            except OSError:
+                return None
+            text = pending_log + content.decode(errors='replace')
+            reason = recording_error(text)
+            # Preserve a partial line between reads without retaining full logs.
+            pending_log = text.rsplit('\n', 1)[-1][-4096:]
+            return reason
+
         while process.poll() is None:
+            recording_failure = check_recording()
+            if recording_failure:
+                try:
+                    process.communicate(b'q', timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                break
             if stopping.stop:
                 process.communicate(b'q')
                 break
@@ -139,8 +173,16 @@ def getVideoFfmpeg(self, url, filename):
             except subprocess.TimeoutExpired:
                 pass
 
+        if process.stdin is not None:
+            process.stdin.close()
         if stderr is not None:
             stderr.close()
+
+        recording_failure = recording_failure or check_recording()
+        if recording_failure:
+            error = True
+            self.logger.warning(recording_failure)
+            return
 
         if process.returncode and process.returncode != 0 and process.returncode != 255:
             details = _tail_file(stderr_path)
