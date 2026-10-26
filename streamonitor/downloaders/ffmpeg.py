@@ -74,7 +74,7 @@ def getVideoFfmpeg(self, url, filename):
         '-seg_max_retry', '20',
         '-m3u8_hold_counters', '20',
         '-i', url,
-        '-c:a', 'copy',
+        '-c:a', getattr(self, 'ffmpeg_audio_codec', 'copy'),
         '-c:v', 'copy',
     ])
     for stream in getattr(self, 'ffmpeg_output_maps', None) or ():

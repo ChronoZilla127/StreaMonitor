@@ -1,8 +1,10 @@
 import json
 import random
 import re
+import ssl
 import time
 import urllib.parse
+from threading import Lock
 
 import requests
 import websocket
@@ -21,6 +23,38 @@ class MyFreeCams(Bot):
     fcs_timeout = 15
     _server_config = None
     _server_config_time = 0
+    _maintenance = False
+    _maintenance_checked_at = None
+    _maintenance_lock = Lock()
+
+    def _check_maintenance(self):
+        # Share the probe across channels, including while the site is down.
+        cls = self.__class__
+        with cls._maintenance_lock:
+            if (cls._maintenance_checked_at is not None
+                    and time.monotonic() - cls._maintenance_checked_at < self.sleep_on_maintenance):
+                return cls._maintenance
+            try:
+                response = self.session.get('https://www.myfreecams.com/', timeout=(10, 20))
+                text = response.text.lower()
+                confirmed = response.status_code in (200, 503) and (
+                    'myfreecams server maintenance' in text
+                    or 'temporarily offline for maintenance' in text
+                )
+                if confirmed:
+                    cls._maintenance = True
+                elif response.status_code == 200:
+                    if cls._maintenance:
+                        # The old configuration may no longer be valid after maintenance.
+                        cls._server_config = None
+                        cls._server_config_time = 0
+                        self.logger.info('MFC maintenance ended; checking channels and resuming recordings automatically')
+                    cls._maintenance = False
+            except requests.RequestException:
+                # An unreachable page cannot confirm that maintenance has ended.
+                pass
+            cls._maintenance_checked_at = time.monotonic()
+            return cls._maintenance
 
     def __init__(self, username):
         super().__init__(username)
@@ -81,6 +115,8 @@ class MyFreeCams(Bot):
                     f'wss://{host}.myfreecams.com/fcsl',
                     timeout=self.fcs_timeout,
                     origin='https://www.myfreecams.com',
+                    sslopt={'context': self._websocket_ssl_context(),
+                            'cert_reqs': ssl.CERT_REQUIRED, 'check_hostname': True},
                 )
                 ws.send('hello fcserver\n\0')
                 ws.send(
@@ -111,11 +147,20 @@ class MyFreeCams(Bot):
                             'camserv': (user.get('u') or {}).get('camserv'),
                         }
             except (OSError, ValueError, json.JSONDecodeError, websocket.WebSocketException) as e:
-                self.logger.warning(f'MFC websocket lookup failed on {host}: {e}')
+                detail = str(e).split(' -+-+- ', 1)[0]
+                self.logger.warning(f'MFC websocket lookup failed on {host}: {detail}')
             finally:
                 if ws:
                     ws.close()
         return None
+
+    @staticmethod
+    def _websocket_ssl_context():
+        # Include Windows/system roots as well as Requests' CA bundle. The
+        # websocket client otherwise builds its own, separate trust store.
+        context = ssl.create_default_context()
+        context.load_verify_locations(cafile=requests.certs.where())
+        return context
 
     @staticmethod
     def _server_candidates(config, camserv):
@@ -183,8 +228,16 @@ class MyFreeCams(Bot):
         return None
 
     def getStatus(self):
+        if self.__class__._maintenance and self._check_maintenance():
+            self.model_info = None
+            self.videoUrl = None
+            return Status.MAINTENANCE
         info = self._lookup_model()
         if info is None:
+            if self._check_maintenance():
+                self.model_info = None
+                self.videoUrl = None
+                return Status.MAINTENANCE
             return Status.UNKNOWN
         if not info:
             self.model_info = None

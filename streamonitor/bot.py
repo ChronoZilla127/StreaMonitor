@@ -36,6 +36,7 @@ class Bot(Thread):
     sleep_on_long_offline = 300
     sleep_on_error = 20
     sleep_on_ratelimit = 180
+    sleep_on_maintenance = 60
     long_offline_timeout = 600
     download_retry_delay = 60
 
@@ -45,6 +46,7 @@ class Bot(Thread):
 
     status_messages = {
         Status.UNKNOWN: "Unknown error",
+        Status.MAINTENANCE: "Servidores en mantenimiento; reintento automatico en 60 segundos",
         Status.PUBLIC: "Channel online",
         Status.OFFLINE: "No stream",
         Status.LONG_OFFLINE: "No stream for a while",
@@ -302,6 +304,8 @@ class Bot(Thread):
                     self._sleep(1)
                 elif self.ratelimit:
                     self._sleep(self.sleep_on_ratelimit)
+                elif self.sc == Status.MAINTENANCE:
+                    self._sleep(self.sleep_on_maintenance)
                 elif offline_time > self.long_offline_timeout:
                     self._sleep(self.sleep_on_long_offline)
                 elif self.sc == Status.PRIVATE:

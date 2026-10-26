@@ -2,6 +2,7 @@ from streamonitor.enums import Status
 
 
 web_status_lookup = {
+    Status.MAINTENANCE: "Servidores en mantenimiento (reintento automatico)",
     Status.PUBLIC: "Online",
     Status.OFFLINE: "Offline",
     Status.PRIVATE: "Private Show",
@@ -14,6 +15,7 @@ web_status_lookup = {
 }
 
 status_icons_lookup = {
+    Status.MAINTENANCE: "tool",
     Status.UNKNOWN: "help-circle",
     Status.PUBLIC: "eye",
     Status.OFFLINE: "video-off",

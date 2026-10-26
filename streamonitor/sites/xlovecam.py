@@ -6,6 +6,21 @@ from streamonitor.enums import Status
 class XLoveCam(Bot):
     site = 'XLoveCam'
     siteslug = 'XLC'
+    ffmpeg_disable_readrate = True
+    ffmpeg_audio_codec = 'copy'
+
+    def handle_ffmpeg_error(self, details):
+        if (self.ffmpeg_audio_codec != 'copy'
+                or 'Error parsing ADTS frame header' not in details):
+            return False
+        # Retry through Bot.run, preserving the partial recording. Encoding
+        # audio bypasses the AAC stream-copy filter that rejected the packet.
+        self.ffmpeg_audio_codec = 'aac'
+        self.logger.warning(
+            'XLC AAC audio could not be copied; the next recording will '
+            'encode audio as AAC while copying video'
+        )
+        return True
 
     def __init__(self, username):
         super().__init__(username)
