@@ -1,17 +1,51 @@
 import json
 import os
+import re
 import subprocess
+from contextlib import ExitStack, closing
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Thread
+from uuid import uuid4
+
 from websocket import create_connection, WebSocketConnectionClosedException, WebSocketException
-from contextlib import closing
-from ffmpy import FFmpeg, FFRuntimeError
 from parameters import DEBUG, CONTAINER, SEGMENT_TIME, FFMPEG_PATH
+from streamonitor.downloaders.postprocess import run_ffmpeg_postprocess
 
 
-def getVideoWSSVR(self, url, filename):
+def _stream_resolution(filename):
+    try:
+        result = run_ffmpeg_postprocess([
+            FFMPEG_PATH, '-hide_banner', '-nostdin', '-probesize', '1048576',
+            '-analyzeduration', '1000000', '-ignore_editlist', '1', '-i', filename,
+            '-map', '0:v:0', '-c:v', 'copy', '-frames:v', '0', '-f', 'null', '-',
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in result.stderr.decode(errors='replace').splitlines():
+        if 'Video:' not in line:
+            continue
+        dimensions = re.search(r', (\d+x\d+)(?=$|[ ,])', line)
+        if dimensions:
+            rate = re.search(r', (\d+(?:\.\d+)?) fps\b', line)
+            fps = f' {float(rate[1]):.1f}fps' if rate else ''
+            return f'{dimensions[1]}{fps}'
+    return None
+
+
+def getVideoWSSVR(self, url, filename, *, origin=None, protocol_version='0.0.1'):
     self.stopDownloadFlag = False
     error = False
-    url = url.replace('fmp4s://', 'wss://')
+    if url.startswith('fmp4s://'):
+        url = url.replace('fmp4s://', 'wss://', 1)
+    modern_protocol = protocol_version == '3.0.0'
+    connection_options = {'origin': origin} if origin else {}
+
+    def send(conn, route, **fields):
+        message = {'url': route, 'version': protocol_version, **fields}
+        if modern_protocol:
+            message['correlationId'] = str(uuid4())
+        conn.send(json.dumps(message))
 
     suffix = ''
     if hasattr(self, 'filename_extra_suffix'):
@@ -26,19 +60,23 @@ def getVideoWSSVR(self, url, filename):
 
     def execute():
         nonlocal error
+        has_media = False
         with open(tmpfilename, 'wb') as outfile:
             while not self.stopDownloadFlag:
                 try:
-                    with closing(create_connection(url, timeout=10)) as conn:
-                        conn.send('{"url":"stream/hello","version":"0.0.1"}')
+                    with closing(create_connection(url, timeout=10, **connection_options)) as conn:
+                        send(conn, 'stream/hello')
                         while not self.stopDownloadFlag:
                             t = conn.recv()
                             try:
                                 tj = json.loads(t)
                                 if 'url' in tj:
                                     if tj['url'] == 'stream/qual':
-                                        conn.send('{"quality":"test","url":"stream/play","version":"0.0.1"}')
-                                        debug_('Connection opened')
+                                        if modern_protocol:
+                                            send(conn, 'stream/play', includeMask=False, passthroughToken='')
+                                        else:
+                                            send(conn, 'stream/play', quality='test')
+                                            debug_('Connection opened')
                                         break
                                 if 'message' in tj:
                                     if tj['message'] == 'ping':
@@ -51,41 +89,77 @@ def getVideoWSSVR(self, url, filename):
                                 return
 
                         while not self.stopDownloadFlag:
-                            outfile.write(conn.recv())
+                            data = conn.recv()
+                            if not data:
+                                raise WebSocketConnectionClosedException()
+                            if isinstance(data, bytes):
+                                outfile.write(data)
+                                if not has_media and (not modern_protocol or data[4:8] == b'moof'):
+                                    has_media = True
+                                    if modern_protocol:
+                                        outfile.flush()
+                                        resolution = _stream_resolution(tmpfilename)
+                                        if resolution:
+                                            self.log(f'Selected {resolution} resolution')
+                                        else:
+                                            debug_('Received video; resolution could not be detected')
                 except WebSocketConnectionClosedException:
+                    if modern_protocol:
+                        # The next connection starts with a new MP4 initialization segment.
+                        break
                     debug_('WebSocket connection closed - try to continue')
                     continue
                 except WebSocketException as wex:
                     debug_('Error when downloading')
                     debug_(wex)
-                    error = True
-                    return
+                    error = not (modern_protocol and has_media)
+                    break
+        if modern_protocol and not has_media:
+            os.remove(tmpfilename)
+            error = True
 
     def terminate():
         self.stopDownloadFlag = True
 
     process = Thread(target=execute)
-    process.start()
     self.stopDownload = terminate
-    process.join()
-    self.stopDownload = None
+    try:
+        if not self.running:
+            return True
+        process.start()
+        process.join()
+    finally:
+        self.stopDownload = None
 
     if error:
         return False
 
-    # Post-processing
     try:
-        stdout = open(filename + '.postprocess_stdout.log', 'w+') if DEBUG else subprocess.DEVNULL
-        stderr = open(filename + '.postprocess_stderr.log', 'w+') if DEBUG else subprocess.DEVNULL
-        output_str = '-c:a copy -c:v copy'
-        if SEGMENT_TIME is not None:
-            output_str += f' -f segment -reset_timestamps 1 -segment_time {str(SEGMENT_TIME)}'
-            filename = basefilename + '_%03d' + suffix + '.' + CONTAINER
-        ff = FFmpeg(executable=FFMPEG_PATH, inputs={tmpfilename: '-ignore_editlist 1'}, outputs={filename: output_str})
-        ff.run(stdout=stdout, stderr=stderr)
+        output = Path(filename)
+        with TemporaryDirectory(prefix='.vr-remux-', dir=output.parent) as directory, ExitStack() as logs:
+            stdout = stderr = subprocess.DEVNULL
+            if DEBUG:
+                stdout = logs.enter_context(open(filename + '.postprocess_stdout.log', 'wb'))
+                stderr = logs.enter_context(open(filename + '.postprocess_stderr.log', 'wb'))
+            command = [FFMPEG_PATH, '-nostdin', '-ignore_editlist', '1', '-i', tmpfilename, '-c', 'copy']
+            output_name = output.name
+            if SEGMENT_TIME is not None:
+                command.extend(['-f', 'segment', '-reset_timestamps', '1', '-segment_time', str(SEGMENT_TIME)])
+                output_name = Path(basefilename).name.replace('%', '%%') + '_%03d' + suffix + '.' + CONTAINER
+            command.append(str(Path(directory) / output_name))
+            result = run_ffmpeg_postprocess(command, stdout=stdout, stderr=stderr)
+            parts = sorted(Path(directory).iterdir())
+            if result.returncode or not parts:
+                self.logger.error(
+                    f'FFmpeg could not finalize the VR recording (exit {result.returncode}); '
+                    f'capture kept at {tmpfilename}'
+                )
+                return False
+            for part in parts:
+                os.replace(part, output.parent / part.name)
         os.remove(tmpfilename)
-    except FFRuntimeError as e:
-        if e.exit_code and e.exit_code != 255:
-            return False
+    except OSError as exc:
+        self.logger.error(f'Could not finalize the VR recording: {exc}')
+        return False
 
     return True

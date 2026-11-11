@@ -6,9 +6,9 @@ Inspired by [Recordurbate](https://github.com/oliverjrose99/Recordurbate)
 ## Supported sites
 | Site name     | Abbreviation | Aliases                     | Quirks                 | Selectable resolution |
 |---------------|--------------|-----------------------------|------------------------|-----------------------|
-| Bongacams     | `BC`         |                             |                        | Yes                   |
-| Cam4          | `C4`         |                             |                        | Yes                   |
-| Cams.com      | `CC`         |                             |                        | Currently only 360p   |
+| Bongacams*     | `BC`         |                             |                        | Yes                   |
+| Cam4*          | `C4`         |                             |                        | Yes                   |
+| Cams.com*      | `CC`         |                             |                        | Currently only 360p   |
 | CamSoda       | `CS`         |                             |                        | Yes                   |
 | Chaturbate    | `CB`         |                             |                        | Yes                   |
 | DreamCam      | `DC`         |                             |                        | No                    |
@@ -23,7 +23,7 @@ Inspired by [Recordurbate](https://github.com/oliverjrose99/Recordurbate)
 | XLoveCam      | `XLC`        |                             |                        | No                    |
 
 Currently not supported:
-* Amateur.TV (They use Widevine now)
+* Amateur.TV (They use Widevine now) no funciona
 * Cherry.tv (They switched to Agora)
 * ImLive (Too strict captcha protection for scraping)
 * LiveJasmin (No nudity in free streams)

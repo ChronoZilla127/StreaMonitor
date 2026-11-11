@@ -15,6 +15,7 @@ import requests.cookies
 from streamonitor.enums import Status, COUNTRIES, Gender, GENDER_DATA
 import streamonitor.log as log
 from parameters import DOWNLOADS_DIR, DEBUG, WANTED_RESOLUTION, WANTED_RESOLUTION_PREFERENCE, CONTAINER, HTTP_USER_AGENT
+from streamonitor.downloaders import DownloadSourceUnavailable
 from streamonitor.downloaders.ffmpeg import getVideoFfmpeg
 from streamonitor.models import VideoData
 
@@ -108,13 +109,14 @@ class Bot(Thread):
         self.running = True
 
     def stop(self, a, b, thread_too=False):
-        if self.running:
-            self.log("Stopping...")
-            if self.stopDownload:
-                self.stopDownload()
-            self.running = False
         if thread_too:
             self.quitting = True
+        if self.running:
+            self.running = False
+            self.log("Stopping...")
+            stop_download = self.stopDownload
+            if stop_download:
+                stop_download()
 
     def getStatus(self):
         return Status.UNKNOWN
@@ -257,6 +259,11 @@ class Bot(Thread):
                             file = self.genOutFilename()
                             try:
                                 ret = self.getVideo(self, video_url, file)
+                            except DownloadSourceUnavailable as exc:
+                                self.recording = False
+                                self.logger.warning(f'{exc}; retrying in {self.sleep_on_error}s')
+                                self._sleep(self.sleep_on_error)
+                                continue
                             except Exception as e:
                                 self.logger.exception(e)
                                 ret = False

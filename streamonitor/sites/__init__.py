@@ -3,6 +3,7 @@ from .bongacams import BongaCams
 from .cam4 import Cam4
 from .camscom import CamsCom
 from .camsoda import CamSoda
+from .camsoda_vr import CamSodaVR
 from .chaturbate import Chaturbate
 from .cherrytv import CherryTV
 from .dreamcam import DreamCam
