@@ -243,5 +243,26 @@
         "running": true,
         "country": null,
         "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "crazyorange",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "sofievanss",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "annieswan",
+        "running": true,
+        "country": null,
+        "gender": null
     }
 ]

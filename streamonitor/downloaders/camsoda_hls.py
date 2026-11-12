@@ -6,6 +6,7 @@ from collections import deque
 from concurrent.futures import Future, wait
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from math import ceil
 from pathlib import Path
 from queue import Queue
@@ -24,6 +25,7 @@ VIDEO_PROGRESS_TIMEOUT = 60
 PLAYLIST_POLL_INTERVAL = 2
 SEGMENT_QUEUE_LIMIT = 100
 SEGMENT_STOP_GRACE = 5
+RECENT_SAVED_SEGMENTS = 256
 
 
 class _RecordingEnded(Exception):
@@ -55,19 +57,19 @@ class _SegmentWorkers:
         for thread in self.threads:
             thread.join()
 
-    def submit(self, url, media):
+    def submit(self, url, media, saved_fingerprints):
         job = Future()
-        self.jobs.put((job, url, media))
+        self.jobs.put((job, url, media, saved_fingerprints))
         return job
 
     def _work(self):
         with requests.Session() as session:
             while (item := self.jobs.get()) is not None:
-                job, url, media = item
+                job, url, media, saved_fingerprints = item
                 if not job.set_running_or_notify_cancel():
                     continue
                 try:
-                    result = self.download(session, url, media)
+                    result = self.download(session, url, media, saved_fingerprints)
                 except BaseException as error:
                     job.set_exception(error)
                 else:
@@ -81,17 +83,23 @@ class _Segment:
     duration: float
     discontinuity: bool
     program_time: datetime | None
+    init_fingerprint: bytes
+    fingerprint: bytes | None = None
 
 
 class _MediaTrack:
-    def __init__(self, url, path):
+    def __init__(self, url, path, saved_segments):
         self.url = url
         self.path = path
         self.queued_uris = set()
         self.pending = deque()
         self.segments = []
+        self.saved_segments = saved_segments
+        self.saved_fingerprints = set(saved_segments)
+        self.skipped_saved_segments = False
         self.init_url = None
         self.initialization = b''
+        self.init_fingerprint = b''
         self.init_path = None
         self.init_group = 0
         self.first_program_time = None
@@ -121,8 +129,8 @@ class _MediaTrack:
             ext = 'm4s' if self.init_path else 'ts'
             path = self.path.with_name(f'{self.path.stem}-{len(self.queued_uris):08d}.{ext}')
             media = _Segment(path, self.init_path, segment.duration or 0, segment.discontinuity,
-                             segment.current_program_date_time)
-            job = submit(urljoin(response.url, segment.uri), media)
+                             segment.current_program_date_time, self.init_fingerprint)
+            job = submit(self, urljoin(response.url, segment.uri), media)
             if job is None:
                 return False
             self.pending.append((job, media))
@@ -142,6 +150,7 @@ class _MediaTrack:
             if self.init_path:
                 self.init_path.write_bytes(data)
             self.initialization = data
+            self.init_fingerprint = sha256(data).digest() if data else b''
         self.init_url = url
 
     def collect(self, logger, report_resolution=None):
@@ -150,13 +159,17 @@ class _MediaTrack:
             if job.cancelled():
                 continue
             try:
-                completed_at = job.result()
+                completed_at, fingerprint = job.result()
             except requests.HTTPError as error:
                 logger.debug('CamSoda segment request returned HTTP %s', error.response.status_code)
                 continue
             except (requests.RequestException, _RecordingEnded) as error:
                 logger.debug('CamSoda segment unavailable (%s)', type(error).__name__)
                 continue
+            if fingerprint in self.saved_fingerprints:
+                self.skipped_saved_segments = True
+                continue
+            media.fingerprint = fingerprint
             if not self.segments:
                 self.first_program_time = media.program_time
                 if report_resolution is not None:
@@ -290,6 +303,7 @@ def getVideoCamSodaHLS(self, urls, filename):
     directory = None
     tracks = []
     remuxed = False
+    discard_duplicate_capture = False
 
     def stopping():
         return stop.is_set() or not self.running or self.quitting
@@ -303,11 +317,15 @@ def getVideoCamSodaHLS(self, urls, filename):
     try:
         if stopping():
             return True
+        history = getattr(self, '_camsoda_saved_segments', None)
+        if history is None:
+            history = self._camsoda_saved_segments = {}
         directory = Path(tempfile.mkdtemp(prefix='.camsoda-', dir=Path(filename).parent))
         with requests.Session() as session:
             drain_deadline = None
             for index, url in enumerate(urls):
-                tracks.append(_MediaTrack(url, directory / f'track-{index}.m3u8'))
+                saved = history.setdefault(index, deque(maxlen=RECENT_SAVED_SEGMENTS))
+                tracks.append(_MediaTrack(url, directory / f'track-{index}.m3u8', saved))
 
             def request(client, url, cancelled):
                 for attempt in range(3):
@@ -331,17 +349,21 @@ def getVideoCamSodaHLS(self, urls, filename):
             def drain_expired():
                 return drain_deadline is not None and monotonic() >= drain_deadline
 
-            def download(client, url, media):
+            def download(client, url, media, saved_fingerprints):
                 data = request(client, url, drain_expired).content
                 if not data or (media.init and not _complete_fragment(data)):
                     raise _RecordingEnded('Incomplete HLS media segment')
-                media.path.write_bytes(data)
-                return monotonic()
+                digest = sha256(media.init_fingerprint)
+                digest.update(data)
+                fingerprint = digest.digest()
+                if fingerprint not in saved_fingerprints:
+                    media.path.write_bytes(data)
+                return monotonic(), fingerprint
 
-            def submit(url, media):
+            def submit(track, url, media):
                 if stopping() or sum(len(track.pending) for track in tracks) >= SEGMENT_QUEUE_LIMIT:
                     return None
-                return pool.submit(url, media)
+                return pool.submit(url, media, track.saved_fingerprints)
 
             def collect():
                 for index, track in enumerate(tracks):
@@ -399,12 +421,18 @@ def getVideoCamSodaHLS(self, urls, filename):
 
     try:
         recorded = [track for track in tracks if track.segments]
+        discard_duplicate_capture = bool(tracks and tracks[0].skipped_saved_segments and not tracks[0].segments)
+        if discard_duplicate_capture:
+            self.logger.debug('CamSoda playlist only offered video already saved')
+            return True
         if not recorded:
             return stopping()
         if recorded[0] is not tracks[0]:
             return False
         _remux(recorded, filename)
         remuxed = True
+        for track in recorded:
+            track.saved_segments.extend(media.fingerprint for media in track.segments)
         return True
     except subprocess.CalledProcessError as error:
         self.logger.error('CamSoda HLS remux failed: %s', error.stderr.decode(errors='replace').strip())
@@ -414,7 +442,7 @@ def getVideoCamSodaHLS(self, urls, filename):
         return False
     finally:
         if directory is not None:
-            if remuxed or not any(path.suffix in ('.m4s', '.ts') and path.stat().st_size
+            if remuxed or discard_duplicate_capture or not any(path.suffix in ('.m4s', '.ts') and path.stat().st_size
                                   for path in directory.iterdir()):
                 _remove_capture_directory(directory, self.logger)
             else:
