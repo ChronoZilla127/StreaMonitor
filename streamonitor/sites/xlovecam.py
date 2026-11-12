@@ -1,5 +1,8 @@
+from functools import partial
+
 import requests
 from streamonitor.bot import Bot
+from streamonitor.downloaders.ffmpeg import getVideoFfmpeg
 from streamonitor.enums import Status
 
 
@@ -9,6 +12,8 @@ class XLoveCam(Bot):
 
     def __init__(self, username):
         super().__init__(username)
+        # Re-encode audio so malformed ADTS packets cannot reach the output muxer.
+        self.getVideo = partial(getVideoFfmpeg, audio_codec='aac')
         self._id = self.getPerformerId()
 
     def getPerformerId(self):
