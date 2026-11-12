@@ -10,7 +10,7 @@ from math import ceil
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
-from time import monotonic
+from time import monotonic, sleep
 from urllib.parse import urljoin
 
 import requests
@@ -262,11 +262,26 @@ def _remux(tracks, filename):
 
 
 def _run_ffmpeg(options):
-    # A console Ctrl+C that requests shutdown must leave the final mux running.
-    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+    # On Windows the mux must have no console so Ctrl+C is handled by StreaMonitor.
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
     cmd = [FFMPEG_PATH, '-nostdin', '-hide_banner', '-loglevel', 'error', *options]
     subprocess.run(cmd, check=True, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE,
                    creationflags=flags, start_new_session=os.name != 'nt')
+
+
+def _remove_capture_directory(directory, logger):
+    # Windows may briefly keep recently closed media files locked.
+    for attempt in range(5):
+        try:
+            shutil.rmtree(directory)
+            return
+        except OSError as error:
+            if isinstance(error, FileNotFoundError) and not directory.exists():
+                return
+            if attempt == 4:
+                logger.warning('CamSoda HLS could not remove temporary files in %s: %s', directory, error)
+                return
+        sleep(0.25)
 
 
 def getVideoCamSodaHLS(self, urls, filename):
@@ -324,7 +339,7 @@ def getVideoCamSodaHLS(self, urls, filename):
                 return monotonic()
 
             def submit(url, media):
-                if sum(len(track.pending) for track in tracks) >= SEGMENT_QUEUE_LIMIT:
+                if stopping() or sum(len(track.pending) for track in tracks) >= SEGMENT_QUEUE_LIMIT:
                     return None
                 return pool.submit(url, media)
 
@@ -399,7 +414,8 @@ def getVideoCamSodaHLS(self, urls, filename):
         return False
     finally:
         if directory is not None:
-            if remuxed or not any(path.stat().st_size for path in directory.iterdir()):
-                shutil.rmtree(directory)
+            if remuxed or not any(path.suffix in ('.m4s', '.ts') and path.stat().st_size
+                                  for path in directory.iterdir()):
+                _remove_capture_directory(directory, self.logger)
             else:
                 self.logger.warning('CamSoda HLS kept downloaded data in %s', directory)
