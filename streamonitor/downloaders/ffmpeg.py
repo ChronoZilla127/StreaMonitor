@@ -28,7 +28,7 @@ def _format_return_code(returncode):
     return str(returncode)
 
 
-def getVideoFfmpeg(self, url, filename):
+def getVideoFfmpeg(self, url, filename, *, audio_codec='copy'):
     cmd = [
         FFMPEG_PATH,
         '-user_agent', self.headers['User-Agent']
@@ -52,7 +52,7 @@ def getVideoFfmpeg(self, url, filename):
         '-seg_max_retry', '20',
         '-m3u8_hold_counters', '20',
         '-i', url,
-        '-c:a', 'copy',
+        '-c:a', audio_codec,
         '-c:v', 'copy',
     ])
 
