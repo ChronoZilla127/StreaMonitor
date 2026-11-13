@@ -25,10 +25,16 @@ VIDEO_PROGRESS_TIMEOUT = 60
 PLAYLIST_POLL_INTERVAL = 2
 SEGMENT_QUEUE_LIMIT = 100
 SEGMENT_STOP_GRACE = 5
+RETRYABLE_HTTP_STATUSES = (408, 500, 502, 503, 504)
+RETRYABLE_REQUEST_ERRORS = (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, requests.Timeout)
 RECENT_SAVED_SEGMENTS = 256
 
 
 class _RecordingEnded(Exception):
+    pass
+
+
+class _PlaylistRequestFailed(_RecordingEnded):
     pass
 
 
@@ -125,7 +131,16 @@ class _MediaTrack:
                 raise _RecordingEnded('Byte-range HLS media is unsupported')
             init_url = urljoin(response.url, init.uri) if init else None
             if init_url != self.init_url or (segment.discontinuity and init_url):
-                self._update_init(init_url, fetch)
+                try:
+                    self._update_init(init_url, fetch)
+                except requests.HTTPError as error:
+                    raise _RecordingEnded(
+                        f'HLS initialization segment returned HTTP {error.response.status_code}'
+                    ) from None
+                except requests.RequestException as error:
+                    raise _RecordingEnded(
+                        f'HLS initialization segment request failed ({type(error).__name__})'
+                    ) from None
             ext = 'm4s' if self.init_path else 'ts'
             path = self.path.with_name(f'{self.path.stem}-{len(self.queued_uris):08d}.{ext}')
             media = _Segment(path, self.init_path, segment.duration or 0, segment.discontinuity,
@@ -303,6 +318,7 @@ def getVideoCamSodaHLS(self, urls, filename):
     directory = None
     tracks = []
     remuxed = False
+    playlist_failure = None
     discard_duplicate_capture = False
 
     def stopping():
@@ -336,9 +352,9 @@ def getVideoCamSodaHLS(self, urls, filename):
                         response.raise_for_status()
                         return response
                     except requests.HTTPError as error:
-                        if attempt == 2 or error.response.status_code not in (408, 500, 502, 503, 504):
+                        if attempt == 2 or error.response.status_code not in RETRYABLE_HTTP_STATUSES:
                             raise
-                    except (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, requests.Timeout):
+                    except RETRYABLE_REQUEST_ERRORS:
                         if attempt == 2:
                             raise
                     stop.wait(0.5 * (attempt + 1))
@@ -370,6 +386,9 @@ def getVideoCamSodaHLS(self, urls, filename):
                     track.collect(self.logger, report_resolution if index == 0 else None)
 
             finished = set()
+            waiting_reported = False
+            video = tracks[0]
+            retrying_video = None
             with _SegmentWorkers(download) as pool:
                 try:
                     while not stopping() and len(finished) < len(tracks):
@@ -380,6 +399,9 @@ def getVideoCamSodaHLS(self, urls, filename):
                             try:
                                 if track.poll(fetch, self._load_m3u8, stopping, submit):
                                     finished.add(track)
+                                if index == 0 and retrying_video is not None:
+                                    self.logger.info('CamSoda HLS video playlist is responding again')
+                                    retrying_video = None
                             except requests.HTTPError as error:
                                 status = error.response.status_code
                                 if index:
@@ -390,19 +412,39 @@ def getVideoCamSodaHLS(self, urls, filename):
                                     self.ratelimit = True
                                 if status in (404, 410):
                                     self.sc = Status.OFFLINE
-                                raise _RecordingEnded(f'HLS playlist returned HTTP {status}') from None
+                                transient = status in RETRYABLE_HTTP_STATUSES
+                                reason = f'video playlist returned HTTP {status}'
                             except (requests.RequestException, _RecordingEnded) as error:
                                 if index:
                                     self.logger.debug('CamSoda audio playlist unavailable (%s)', type(error).__name__)
                                     continue
                                 if isinstance(error, _RecordingEnded):
                                     raise
-                                raise _RecordingEnded(f'HLS playlist request failed ({type(error).__name__})') from None
+                                transient = isinstance(error, RETRYABLE_REQUEST_ERRORS)
+                                reason = f'video playlist request failed ({type(error).__name__})'
+                            else:
+                                continue
+                            attempts = 3 if transient else 1
+                            failure = _PlaylistRequestFailed(f'{reason} after {attempts} attempt(s)')
+                            video.collect(self.logger, report_resolution)
+                            if not transient or not video.segments:
+                                raise failure
+                            if retrying_video is None:
+                                self.logger.warning('CamSoda HLS %s; keeping the recording open and retrying', failure)
+                            retrying_video = failure
                         collect()
                         if len(finished) == len(tracks) or stopping():
                             break
-                        remaining = VIDEO_PROGRESS_TIMEOUT - (monotonic() - tracks[0].last_segment_at)
+                        if (not waiting_reported and video not in finished and not video.segments
+                                and not video.pending and (not video.queued_uris or video.skipped_saved_segments)):
+                            self.logger.info('Channel online; waiting for new video segments.')
+                            waiting_reported = True
+                        remaining = VIDEO_PROGRESS_TIMEOUT - (monotonic() - video.last_segment_at)
                         if remaining <= 0:
+                            if retrying_video is not None:
+                                raise _PlaylistRequestFailed(
+                                    f'{retrying_video}; no new video segments for {VIDEO_PROGRESS_TIMEOUT} seconds'
+                                )
                             raise _RecordingEnded('No new HLS video segments for 60 seconds')
                         stop.wait(min(PLAYLIST_POLL_INTERVAL, remaining))
                 finally:
@@ -411,6 +453,8 @@ def getVideoCamSodaHLS(self, urls, filename):
                     _, unfinished = wait(pending, timeout=SEGMENT_STOP_GRACE)
                     wait([job for job in unfinished if not job.cancel()])
                     collect()
+    except _PlaylistRequestFailed as error:
+        playlist_failure = error
     except _RecordingEnded as error:
         if not stopping():
             self.logger.warning('CamSoda HLS ended: %s', error)
@@ -421,9 +465,11 @@ def getVideoCamSodaHLS(self, urls, filename):
 
     try:
         recorded = [track for track in tracks if track.segments]
+        if playlist_failure and (not recorded or recorded[0] is not tracks[0]):
+            self.logger.warning('CamSoda HLS %s; no new video was saved', playlist_failure)
+            self.download_error_reported = True
         discard_duplicate_capture = bool(tracks and tracks[0].skipped_saved_segments and not tracks[0].segments)
         if discard_duplicate_capture:
-            self.logger.debug('CamSoda playlist only offered video already saved')
             return True
         if not recorded:
             return stopping()
@@ -431,14 +477,19 @@ def getVideoCamSodaHLS(self, urls, filename):
             return False
         _remux(recorded, filename)
         remuxed = True
+        if playlist_failure:
+            self.logger.warning('CamSoda HLS %s; saved %s with the video received',
+                                playlist_failure, Path(filename).name if SEGMENT_TIME is None else 'the output files')
         for track in recorded:
             track.saved_segments.extend(media.fingerprint for media in track.segments)
         return True
     except subprocess.CalledProcessError as error:
         self.logger.error('CamSoda HLS remux failed: %s', error.stderr.decode(errors='replace').strip())
+        self.download_error_reported = True
         return False
     except OSError as error:
         self.logger.error('CamSoda HLS remux failed: %s', error)
+        self.download_error_reported = True
         return False
     finally:
         if directory is not None:

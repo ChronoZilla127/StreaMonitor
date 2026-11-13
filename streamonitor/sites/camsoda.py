@@ -61,14 +61,26 @@ class CamSoda(Bot):
             params['filter'] = 'tracks:v4v3v2v1a1a2'
             url = f'{base}index.ll.m3u8?{urlencode(params)}'
 
-        try:
-            response = self.session.get(url, headers=self.headers, cookies=self.cookies, timeout=10)
-        except requests.RequestException as error:
-            self.logger.warning('CamSoda HLS master request failed (%s)', type(error).__name__)
-            return None
-        if response.status_code != 200:
-            self.logger.warning('CamSoda HLS master returned HTTP %s', response.status_code)
-            return None
+        for attempt in range(1, 4):
+            try:
+                response = self.session.get(url, headers=self.headers, cookies=self.cookies, timeout=10)
+                if response.status_code == 200:
+                    break
+                reason = f'HTTP {response.status_code}'
+                retryable = response.status_code in (408, 500, 502, 503, 504)
+            except requests.RequestException as error:
+                reason = type(error).__name__
+                retryable = isinstance(error, (requests.ConnectionError, requests.Timeout,
+                                               requests.exceptions.ChunkedEncodingError))
+            if not retryable or attempt == 3:
+                self.logger.warning('CamSoda HLS master playlist failed (%s) after %d attempt(s); recording did not start',
+                                    reason, attempt)
+                self.download_error_reported = True
+                return None
+            self._sleep(1)
+            if not self.running or self.quitting:
+                self.download_error_reported = True
+                return None
         master = self._load_m3u8(response.text)
         selected = self.getWantedResolutionPlaylist(response.url, m3u_data=master)
         if selected is None:
@@ -99,13 +111,13 @@ class CamSoda(Bot):
             try:
                 with CamSoda._status_lock:
                     if monotonic() < CamSoda._status_retry_at:
-                        self.ratelimit = True
+                        self.ratelimit = limited != Status.LONG_OFFLINE
                         return limited
                     r = self.session.get(url, headers=self.headers, timeout=(4, 5))
                     if r.status_code == 429:
                         delay = self._status_retry_delay(r.headers.get('Retry-After'))
                         CamSoda._status_retry_at = monotonic() + delay
-                        self.ratelimit = True
+                        self.ratelimit = limited != Status.LONG_OFFLINE
                         self.logger.warning('CamSoda returned HTTP 429. Pausing status checks for %.0f seconds', delay)
                         return limited
                 break
@@ -139,7 +151,7 @@ class CamSoda(Bot):
         if stream_data.get('private_servers'):
             return Status.PRIVATE
         if "token" in stream_data:
-            return Status.OFFLINE
+            return Status.LONG_OFFLINE if unavailable == Status.LONG_OFFLINE else Status.OFFLINE
         return unavailable
 
     def _status_retry_delay(self, value):
