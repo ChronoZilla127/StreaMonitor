@@ -205,7 +205,7 @@
     {
         "site": "XLoveCam",
         "username": "matureedesiree",
-        "running": true,
+        "running": false,
         "country": null,
         "gender": null
     },
@@ -226,13 +226,62 @@
     {
         "site": "XLoveCam",
         "username": "innocenthazel",
-        "running": true,
+        "running": false,
         "country": null,
         "gender": null
     },
     {
         "site": "CamSoda",
         "username": "irisherrera",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "kyliejo19",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "crazyorange",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "sofievanss",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "annieswan",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "melissajhonson00",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "mia-evansx",
+        "running": true,
+        "country": null,
+        "gender": null
+    },
+    {
+        "site": "CamSoda",
+        "username": "millisenta",
         "running": true,
         "country": null,
         "gender": null

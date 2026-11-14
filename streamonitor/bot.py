@@ -224,6 +224,7 @@ class Bot(Thread):
                                 cookie_update_process.start()
 
                             try:
+                                self.download_error_reported = False
                                 video_url = self.getVideoUrl()
                             except Exception as e:
                                 self.logger.exception(e)
@@ -232,7 +233,8 @@ class Bot(Thread):
                             if video_url is None:
                                 if self.sc == Status.PUBLIC:
                                     self.sc = Status.ERROR
-                                    self.logger.error(self.status())
+                                    if not self.download_error_reported:
+                                        self.logger.error(self.status())
                                     self._sleep(self.sleep_on_error)
                                 elif self.sc == Status.PRIVATE:
                                     self.defer_download_attempt()
@@ -258,9 +260,10 @@ class Bot(Thread):
                             if not ret:
                                 self.recording = False
                                 if self.sc == Status.PUBLIC:
-                                    self.log('Recording ended with error')
                                     self.sc = Status.ERROR
-                                    self.log(self.status())
+                                    if not self.download_error_reported:
+                                        self.log('Recording ended with error')
+                                        self.log(self.status())
                                     self._sleep(self.sleep_on_error)
                                 else:
                                     self.log('Recording ended')
