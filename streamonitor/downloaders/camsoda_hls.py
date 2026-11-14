@@ -5,7 +5,7 @@ import tempfile
 from collections import deque
 from concurrent.futures import Future, wait
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import sha256
 from math import ceil
 from pathlib import Path
@@ -25,6 +25,7 @@ VIDEO_PROGRESS_TIMEOUT = 60
 PLAYLIST_POLL_INTERVAL = 2
 SEGMENT_QUEUE_LIMIT = 100
 SEGMENT_STOP_GRACE = 5
+RECOVERY_INTERVAL = 10
 RETRYABLE_HTTP_STATUSES = (408, 500, 502, 503, 504)
 RETRYABLE_REQUEST_ERRORS = (requests.exceptions.ChunkedEncodingError, requests.ConnectionError, requests.Timeout)
 RECENT_SAVED_SEGMENTS = 256
@@ -35,6 +36,10 @@ class _RecordingEnded(Exception):
 
 
 class _PlaylistRequestFailed(_RecordingEnded):
+    pass
+
+
+class _RecoveryRateLimited(_RecordingEnded):
     pass
 
 
@@ -90,6 +95,7 @@ class _Segment:
     discontinuity: bool
     program_time: datetime | None
     init_fingerprint: bytes
+    source_generation: int
     fingerprint: bytes | None = None
 
 
@@ -102,6 +108,7 @@ class _MediaTrack:
         self.segments = []
         self.saved_segments = saved_segments
         self.saved_fingerprints = set(saved_segments)
+        self.recorded_fingerprints = set()
         self.skipped_saved_segments = False
         self.init_url = None
         self.initialization = b''
@@ -110,6 +117,14 @@ class _MediaTrack:
         self.init_group = 0
         self.first_program_time = None
         self.last_segment_at = monotonic()
+        self.source_generation = 0
+        self.last_program_end = None
+
+    def switch_source(self, url):
+        if self.url != url:
+            self.url = url
+            self.init_url = None
+            self.source_generation += 1
 
     def poll(self, fetch, parse, stopping, submit):
         response = fetch(self.url)
@@ -121,7 +136,10 @@ class _MediaTrack:
             if stopping():
                 return False
             # LL-HLS can end with a partial segment that has no media URI yet.
-            if not segment.uri or segment.uri in self.queued_uris or segment.gap_tag:
+            if not segment.uri or segment.gap_tag:
+                continue
+            segment_url = urljoin(response.url, segment.uri)
+            if segment_url in self.queued_uris:
                 continue
 
             if segment.key and segment.key.method != 'NONE':
@@ -144,12 +162,12 @@ class _MediaTrack:
             ext = 'm4s' if self.init_path else 'ts'
             path = self.path.with_name(f'{self.path.stem}-{len(self.queued_uris):08d}.{ext}')
             media = _Segment(path, self.init_path, segment.duration or 0, segment.discontinuity,
-                             segment.current_program_date_time, self.init_fingerprint)
-            job = submit(self, urljoin(response.url, segment.uri), media)
+                             segment.current_program_date_time, self.init_fingerprint, self.source_generation)
+            job = submit(self, segment_url, media)
             if job is None:
                 return False
             self.pending.append((job, media))
-            self.queued_uris.add(segment.uri)
+            self.queued_uris.add(segment_url)
 
         return playlist.is_endlist
 
@@ -184,7 +202,22 @@ class _MediaTrack:
             if fingerprint in self.saved_fingerprints:
                 self.skipped_saved_segments = True
                 continue
+            if fingerprint in self.recorded_fingerprints:
+                continue
+            switched = bool(self.segments and media.source_generation != self.segments[-1].source_generation)
+            if media.program_time is not None and media.program_time.utcoffset() is not None:
+                if self.last_program_end is not None:
+                    gap = (media.program_time - self.last_program_end).total_seconds()
+                    if gap < -0.25 and (switched or not media.discontinuity):
+                        continue
+                    if gap > 0.25 and report_resolution is not None:
+                        logger.warning('CamSoda HLS video gap: %.2f seconds (playlist timestamps)', gap)
+                self.last_program_end = media.program_time + timedelta(seconds=media.duration)
+            else:
+                self.last_program_end = None
             media.fingerprint = fingerprint
+            media.discontinuity |= switched
+            self.recorded_fingerprints.add(fingerprint)
             if not self.segments:
                 self.first_program_time = media.program_time
                 if report_resolution is not None:
@@ -359,7 +392,11 @@ def getVideoCamSodaHLS(self, urls, filename):
                             raise
                     stop.wait(0.5 * (attempt + 1))
 
+            recovered_responses = {}
+
             def fetch(url):
+                if url in recovered_responses:
+                    return recovered_responses.pop(url)
                 return request(session, url, stopping)
 
             def drain_expired():
@@ -389,6 +426,50 @@ def getVideoCamSodaHLS(self, urls, filename):
             waiting_reported = False
             video = tracks[0]
             retrying_video = None
+            next_recovery_at = 0
+
+            def recover_source():
+                def expired():
+                    return stopping() or monotonic() - video.last_segment_at >= VIDEO_PROGRESS_TIMEOUT
+
+                def probe(url):
+                    if expired():
+                        raise _RecordingEnded('HLS recovery window ended')
+                    response = session.get(url, headers=self.headers, cookies=self.cookies, timeout=(2, 3))
+                    if response.status_code == 429:
+                        self.sc = Status.RATELIMIT
+                        self.ratelimit = True
+                        raise _RecoveryRateLimited('HLS recovery playlist returned HTTP 429')
+                    response.raise_for_status()
+                    return response
+
+                tried = {video.url}
+                for candidate in self.recovery_playlists(probe, expired):
+                    if expired():
+                        break
+                    if len(candidate) != len(tracks) or candidate[0] in tried:
+                        continue
+                    tried.add(candidate[0])
+                    responses = {}
+                    try:
+                        for url in candidate:
+                            response = probe(url)
+                            playlist = self._load_m3u8(response.text)
+                            if playlist.is_variant or not any(segment.uri for segment in playlist.segments):
+                                break
+                            responses[url] = response
+                        else:
+                            for track, url in zip(tracks, candidate):
+                                track.switch_source(url)
+                            finished.clear()
+                            recovered_responses.clear()
+                            recovered_responses.update(responses)
+                            self.logger.info('CamSoda HLS switched to another playlist in the same recording')
+                            return True
+                    except (requests.RequestException, ValueError, KeyError):
+                        continue
+                return False
+
             with _SegmentWorkers(download) as pool:
                 try:
                     while not stopping() and len(finished) < len(tracks):
@@ -427,11 +508,25 @@ def getVideoCamSodaHLS(self, urls, filename):
                             attempts = 3 if transient else 1
                             failure = _PlaylistRequestFailed(f'{reason} after {attempts} attempt(s)')
                             video.collect(self.logger, report_resolution)
-                            if not transient or not video.segments:
+                            if not transient:
                                 raise failure
-                            if retrying_video is None:
+                            if retrying_video is None and video.segments:
                                 self.logger.warning('CamSoda HLS %s; keeping the recording open and retrying', failure)
                             retrying_video = failure
+                            if monotonic() >= next_recovery_at:
+                                next_recovery_at = monotonic() + RECOVERY_INTERVAL
+                                try:
+                                    if recover_source():
+                                        break
+                                except _RecoveryRateLimited as error:
+                                    raise _PlaylistRequestFailed(str(error)) from None
+                                except _RecordingEnded:
+                                    if not stopping():
+                                        raise failure from None
+                                if self.sc in (Status.PRIVATE, Status.OFFLINE, Status.LONG_OFFLINE, Status.RATELIMIT):
+                                    raise failure
+                            if not video.segments:
+                                raise failure
                         collect()
                         if len(finished) == len(tracks) or stopping():
                             break

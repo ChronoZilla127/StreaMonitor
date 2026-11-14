@@ -7,7 +7,7 @@ from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
 
 import requests
 
-from parameters import env
+from parameters import WANTED_RESOLUTION, WANTED_RESOLUTION_PREFERENCE, env
 from streamonitor.bot import Bot
 from streamonitor.downloaders.camsoda_hls import getVideoCamSodaHLS
 from streamonitor.enums import Status
@@ -52,15 +52,8 @@ class CamSoda(Bot):
         if not self.custom_hls:
             return self.getWantedResolutionPlaylist(url)
 
-        renditions = stream.get('quality_renditions')
-        params = {'multitrack': 'true', 'token': token}
-        if isinstance(renditions, str) and renditions:
-            params['filter.tracks'] = 'v4v3v2v1a1a2'
-            url = f"{base}tracks-v{quote(renditions, safe='')}a2/index.ll.m3u8?{urlencode(params)}"
-        else:
-            params['filter'] = 'tracks:v4v3v2v1a1a2'
-            url = f'{base}index.ll.m3u8?{urlencode(params)}'
-
+        url, params = self._custom_master_url(stream, server)
+        self._hls_alternatives = ()
         for attempt in range(1, 4):
             try:
                 response = self.session.get(url, headers=self.headers, cookies=self.cookies, timeout=10)
@@ -86,15 +79,69 @@ class CamSoda(Bot):
         if selected is None:
             return None
 
-        variant = next((p for p in master.playlists if urljoin(response.url, p.uri) == selected), None)
+        self._hls_alternatives = tuple(self._variant_urls(master, response.url, url, params))
+        return self._track_urls(master, response.url, url, params, selected)
+
+    @staticmethod
+    def _custom_master_url(stream, server, multivariant=False):
+        base = f"https://{server}/{stream['stream_name']}_v1/"
+        renditions = stream.get('quality_renditions')
+        params = {'multitrack': 'true', 'token': stream['token']}
+        if not multivariant and isinstance(renditions, str) and renditions:
+            params['filter.tracks'] = 'v4v3v2v1a1a2'
+            path = f"tracks-v{quote(renditions, safe='')}a2/index.ll.m3u8"
+        else:
+            params['filter'] = 'tracks:v4v3v2v1a1a2'
+            path = 'index.ll.m3u8'
+        return f'{base}{path}?{urlencode(params)}', params
+
+    @staticmethod
+    def _track_urls(master, response_url, url, params, selected):
+        variant = next((p for p in master.playlists if urljoin(response_url, p.uri) == selected), None)
         video_url = _playlist_url(url, selected, params)
         if variant and variant.stream_info.audio:
             audio = [m for m in master.media if m.type == 'AUDIO' and m.group_id == variant.stream_info.audio]
             rendition = next((m for m in audio if m.default == 'YES'), audio[0] if audio else None)
             if rendition and rendition.uri:
-                audio_url = _playlist_url(url, urljoin(response.url, rendition.uri), params)
+                audio_url = _playlist_url(url, urljoin(response_url, rendition.uri), params)
                 return video_url, audio_url
         return (video_url,)
+
+    def _variant_urls(self, master, response_url, url, params):
+        variants = []
+        for playlist in master.playlists:
+            resolution = playlist.stream_info.resolution
+            if not resolution:
+                continue
+            delta = min(resolution) - WANTED_RESOLUTION
+            if ((WANTED_RESOLUTION_PREFERENCE == 'exact' and delta != 0)
+                    or (WANTED_RESOLUTION_PREFERENCE == 'exact_or_least_higher' and delta < 0)
+                    or (WANTED_RESOLUTION_PREFERENCE == 'exact_or_highest_lower' and delta > 0)):
+                continue
+            variants.append((abs(delta), urljoin(response_url, playlist.uri)))
+        for _, selected in sorted(variants, key=lambda variant: variant[0]):
+            yield self._track_urls(master, response_url, url, params, selected)
+
+    def recovery_playlists(self, fetch, stopping):
+        yield from self._hls_alternatives
+        if stopping():
+            return
+        status = self.getStatus()
+        if status in (Status.PRIVATE, Status.OFFLINE, Status.LONG_OFFLINE, Status.RATELIMIT):
+            self.sc = status
+        if status != Status.PUBLIC:
+            return
+        stream = self.lastInfo['stream']
+        for server in stream['edge_servers']:
+            if stopping():
+                return
+            url, params = self._custom_master_url(stream, server, multivariant=True)
+            try:
+                response = fetch(url)
+                master = self._load_m3u8(response.text)
+            except (requests.RequestException, ValueError, KeyError):
+                continue
+            yield from self._variant_urls(master, response.url, url, params)
 
     def getStatus(self):
         if self._first_status_check:
