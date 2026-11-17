@@ -6,10 +6,10 @@ Inspired by [Recordurbate](https://github.com/oliverjrose99/Recordurbate)
 ## Supported sites
 | Site name     | Abbreviation | Aliases                     | Quirks                 | Selectable resolution |
 |---------------|--------------|-----------------------------|------------------------|-----------------------|
-| Bongacams     | `BC`         |                             |                        | Yes                   |
-| Cam4          | `C4`         |                             |                        | Yes                   |
-| Cams.com      | `CC`         |                             |                        | Currently only 360p   |
-| CamSoda       | `CS`         |                             |                        | Yes                   |
+| Bongacams*     | `BC`         |                             |                        | Yes                   |
+| Cam4*          | `C4`         |                             |                        | Yes                   |
+| Cams.com*      | `CC`         |                             |                        | Currently only 360p   |
+| CamSoda*       | `CS`         |                             |                        | Yes                   |
 | Chaturbate    | `CB`         |                             |                        | Yes                   |
 | DreamCam      | `DC`         |                             |                        | No                    |
 | DreamCam VR   | `DCVR`       |                             | for VR videos          | No                    |

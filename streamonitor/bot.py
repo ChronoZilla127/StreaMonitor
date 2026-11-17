@@ -260,6 +260,12 @@ class Bot(Thread):
                             if not ret:
                                 self.recording = False
                                 if self.sc == Status.PUBLIC:
+                                    if self.download_attempt_deferred():
+                                        try:
+                                            self.cache_file_list()
+                                        except Exception as e:
+                                            self.logger.exception(e)
+                                        continue
                                     self.sc = Status.ERROR
                                     if not self.download_error_reported:
                                         self.log('Recording ended with error')
