@@ -1,4 +1,3 @@
-import json
 import os
 import shutil
 import subprocess
@@ -6,12 +5,11 @@ import tempfile
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from hashlib import sha256
 from math import ceil
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Event, Lock, Thread
+from threading import Event, Thread
 from time import monotonic
 from urllib.parse import urljoin, urlsplit
 
@@ -45,47 +43,6 @@ class _Fragment:
 def _complete_mp4(data, *required):
     boxes = list(_iter_mp4_boxes(data))
     return sum(size for _, _, _, size in boxes) == len(data) and set(required) <= {box[0] for box in boxes}
-
-
-class _StallDiagnostic:
-    def __init__(self):
-        self.events = deque(maxlen=256)
-        self.lock = Lock()
-
-    def add(self, kind, **details):
-        with self.lock:
-            self.events.append((monotonic(), {'kind': kind, **details}))
-
-    def save(self, filename, last_progress, pending, next_sequence):
-        with self.lock:
-            events = [dict(event, seconds_after_progress=round(when - last_progress, 3))
-                      for when, event in self.events if when >= last_progress]
-        playlists = [event for event in events if event['kind'] == 'playlist']
-        complete = [event for event in playlists if event['complete_segments']]
-        ranges = {(event['first_complete'], event['last_complete']) for event in complete}
-        if not playlists:
-            pattern = 'no_playlist_response'
-        elif not complete:
-            pattern = 'partial_segments_only' if any(event['parts'] for event in playlists) else 'empty_playlist'
-        elif any(event['kind'] in ('segment_failure', 'initialization_failure') for event in events):
-            pattern = 'media_download_failures'
-        elif len(complete) > 1 and len(ranges) == 1:
-            pattern = 'complete_segments_not_advancing'
-        elif any(entry['state'] == 'running' for entry in pending):
-            pattern = 'media_requests_in_flight'
-        else:
-            pattern = 'undetermined'
-        path = Path(filename + '.hls-stall.json')
-        path.write_text(json.dumps({
-            'captured_at_utc': datetime.now(timezone.utc).isoformat(),
-            'seconds_without_progress': round(monotonic() - last_progress, 3),
-            'pattern': pattern,
-            'next_sequence': next_sequence,
-            'pending_sequences': [entry['sequence'] for entry in pending],
-            'pending_requests': pending,
-            'events': events,
-        }, indent=2) + '\n', encoding='utf-8')
-        return path, pattern
 
 
 def _ffmpeg(directory, args):
@@ -157,7 +114,6 @@ def getVideoDreamCam(self, url, filename):
     recorded_fingerprints = deque(maxlen=RECENT_SEGMENTS)
     duplicates = 0
     next_sequence = None
-    diagnostic = _StallDiagnostic()
 
     def stopping():
         return stop.is_set() or not self.running or self.quitting
@@ -189,18 +145,15 @@ def getVideoDreamCam(self, url, filename):
         for attempt in range(2):
             if (monotonic() >= deadline or (drain_deadline is not None and monotonic() >= drain_deadline)
                     or (oldest is not None and fragment.sequence < oldest)):
-                diagnostic.add('segment_failure', sequence=fragment.sequence, reason='expired_or_deadline')
                 return None
             try:
                 data = read_fragment(session, fragment.url, deadline)
             except requests.HTTPError as error:
                 status = error.response.status_code
-                diagnostic.add('segment_failure', sequence=fragment.sequence, http_status=status)
                 if status in (404, 410) or attempt or status not in (408, 500, 502, 503, 504):
                     self.logger.debug('DreamCam segment %s returned HTTP %s', fragment.sequence, status)
                     return None
-            except (requests.RequestException, ResponseReadError) as error:
-                diagnostic.add('segment_failure', sequence=fragment.sequence, reason=type(error).__name__)
+            except (requests.RequestException, ResponseReadError):
                 if attempt:
                     return None
             else:
@@ -212,7 +165,6 @@ def getVideoDreamCam(self, url, filename):
                         progress.put(completed)
                         return completed, fingerprint
                     return monotonic(), fingerprint
-                diagnostic.add('segment_failure', sequence=fragment.sequence, reason='incomplete_fmp4')
         return None
 
     def worker():
@@ -240,7 +192,6 @@ def getVideoDreamCam(self, url, filename):
             completed, fingerprint = result
             if fingerprint in already_saved:
                 duplicates += 1
-                diagnostic.add('duplicate_segment', sequence=fragment.sequence)
                 continue
             if recorded and fragment.sequence > recorded[-1].sequence + 1:
                 self.logger.warning('DreamCam skipped %s unavailable segment(s)',
@@ -265,16 +216,6 @@ def getVideoDreamCam(self, url, filename):
                     if monotonic() - last_progress >= VIDEO_TIMEOUT:
                         self.logger.warning('DreamCam HLS supplied no new complete segments for %s seconds (%s already saved)',
                                             VIDEO_TIMEOUT, duplicates)
-                        try:
-                            requests_pending = [
-                                {'sequence': fragment.sequence,
-                                 'state': 'done' if future.done() else 'running' if future.running() else 'queued'}
-                                for future, fragment in pending
-                            ]
-                            path, pattern = diagnostic.save(filename, last_progress, requests_pending, next_sequence)
-                            self.logger.info('Saved DreamCam stall diagnostic (%s) to %s', pattern, path.name)
-                        except OSError as error:
-                            self.logger.warning('Could not save DreamCam stall diagnostic (%s)', type(error).__name__)
                         break
                     reading_playlist = True
                     try:
@@ -284,11 +225,6 @@ def getVideoDreamCam(self, url, filename):
                         if not response.text.lstrip('\ufeff').startswith('#EXTM3U') or playlist.is_variant:
                             raise ValueError('Expected a DreamCam HLS media playlist')
                         segments = [segment for segment in playlist.segments if segment.uri and not segment.gap_tag]
-                        diagnostic.add('playlist', media_sequence=playlist.media_sequence,
-                                       complete_segments=len(segments),
-                                       first_complete=segments[0].media_sequence if segments else None,
-                                       last_complete=segments[-1].media_sequence if segments else None,
-                                       parts=sum(len(segment.parts) for segment in playlist.segments))
                         if segments:
                             if next_sequence is None:
                                 start = segments if playlist.is_endlist else segments[-2:]
@@ -296,8 +232,7 @@ def getVideoDreamCam(self, url, filename):
                             oldest = playlist.media_sequence
                             for result, fragment in pending:
                                 if fragment.sequence < oldest:
-                                    if result.cancel():
-                                        diagnostic.add('segment_failure', sequence=fragment.sequence, reason='expired_in_queue')
+                                    result.cancel()
 
                         for segment in segments:
                             if stopping() or len(pending) >= MAX_PENDING:
@@ -329,7 +264,6 @@ def getVideoDreamCam(self, url, filename):
                             break
                     except requests.HTTPError as error:
                         status = error.response.status_code
-                        diagnostic.add('playlist_failure' if reading_playlist else 'initialization_failure', http_status=status)
                         if reading_playlist and status in (403, 404, 410, 429):
                             if status == 429:
                                 self.sc = Status.RATELIMIT
@@ -337,8 +271,6 @@ def getVideoDreamCam(self, url, filename):
                             self.logger.info('DreamCam playlist returned HTTP %s', status)
                             break
                     except requests.RequestException as error:
-                        diagnostic.add('playlist_failure' if reading_playlist else 'initialization_failure',
-                                       reason=type(error).__name__)
                         self.logger.debug('DreamCam HLS request failed (%s)', type(error).__name__)
                     stop.wait(POLL_INTERVAL)
         except (OSError, ValueError, KeyError) as error:
