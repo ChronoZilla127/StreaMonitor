@@ -6,6 +6,8 @@ import re
 import requests
 import base64
 import hashlib
+from time import monotonic
+from urllib.parse import quote
 
 from streamonitor.bot import RoomIdBot
 from streamonitor.downloaders.hls import getVideoNativeHLS
@@ -19,6 +21,7 @@ class StripChat(RoomIdBot):
     bulk_update = True
     status_request_attempts = 3
     status_request_timeout = (10, 20)
+    status_lookup_retry_delay = 60
     _static_data = None
     _mouflon_cache_filename = 'stripchat_mouflon_keys.json'
     _mouflon_keys: dict = None
@@ -43,6 +46,8 @@ class StripChat(RoomIdBot):
                 print('Error loading mouflon key cache:', e)
 
     def __init__(self, username, room_id=None):
+        self._last_lookup_status = None
+        self._next_status_lookup_at = 0
         if StripChat._static_data is None:
             StripChat._static_data = {}
             try:
@@ -51,6 +56,9 @@ class StripChat(RoomIdBot):
                 print('Error initializing StripChat static data:', e)
 
         super().__init__(username, room_id)
+        if self.room_id is None and self._last_lookup_status != Status.NOTEXIST:
+            # A rejected request does not establish that the account is missing.
+            self.sc = Status.NOTRUNNING
         self._id = None
         self.vr = False
         self.getVideo = lambda _, url, filename: getVideoNativeHLS(
@@ -206,7 +214,40 @@ class StripChat(RoomIdBot):
         return ''.join(random.choice(chars) for _ in range(length))
 
     def _getStatusData(self, username):
-        url = f'https://stripchat.com/api/front/v2/models/username/{username}/cam'
+        model_id = self.room_id if username == self.username else None
+        if model_id is None and username.isnumeric():
+            model_id = username
+        if model_id is None:
+            model_id = self._resolveRoomId(username)
+            if model_id is None:
+                if self._last_lookup_status == Status.NOTEXIST:
+                    return {'error': 'Not Found'}
+                return None
+            if username == self.username:
+                self.room_id = model_id
+        return self._requestStatusJson(
+            f'https://stripchat.com/api/front/v2/models/{model_id}/cam'
+        )
+
+    def _resolveRoomId(self, username):
+        data = self._requestStatusJson(
+            f'https://stripchat.com/api/front/users/user-ids/{quote(username, safe="")}'
+        )
+        self._last_lookup_status = None
+        if data is None:
+            return None
+        model_id = data.get('id')
+        if isinstance(model_id, (str, int)) and not isinstance(model_id, bool):
+            if str(model_id).isdigit() and int(model_id) > 0:
+                return str(model_id)
+        if data.get('error') == 'Not Found':
+            self._last_lookup_status = Status.NOTEXIST
+        else:
+            self.logger.warning('StripChat username lookup did not return a valid ID')
+        return None
+
+    def _requestStatusJson(self, url):
+        self._next_status_lookup_at = monotonic() + self.status_lookup_retry_delay
         for attempt in range(1, self.status_request_attempts + 1):
             try:
                 r = self.session.get(
@@ -235,10 +276,20 @@ class StripChat(RoomIdBot):
                 self.session.cookies.update(session_cookies)
                 self._sleep(delay)
 
+        if not r.ok:
+            self.logger.warning(
+                'StripChat status request failed: HTTP %s', r.status_code,
+            )
+            if r.status_code != 404:
+                return None
+
         try:
             data = r.json()
         except requests.exceptions.JSONDecodeError:
-            self.log('Failed to parse JSON response')
+            self.logger.warning('Failed to parse StripChat status response')
+            return None
+        if not isinstance(data, dict):
+            self.logger.warning('StripChat status response has an unexpected JSON structure')
             return None
         return data
 
@@ -253,6 +304,10 @@ class StripChat(RoomIdBot):
                 self.logger.warn(f'Status returned error: {error}')
             return Status.UNKNOWN
 
+        user = data.get('user')
+        if not isinstance(user, dict) or not isinstance(user.get('user'), dict):
+            return Status.UNKNOWN
+
         self.lastInfo = {'model': data['user']['user']}
         if isinstance(data['cam'], dict):
             self.lastInfo |= data['cam']
@@ -261,19 +316,14 @@ class StripChat(RoomIdBot):
     def getRoomIdFromUsername(self, username):
         if username == self.username and self.room_id is not None:
             return self.room_id
+        return self._resolveRoomId(username)
 
-        data = self._getStatusData(username)
-        if username == self.username:
-            self._update_lastInfo(data)
-
-        if not data or 'user' not in data:
+    def getUsernameFromRoomId(self, room_id):
+        data = self._getStatusData(room_id)
+        self._last_lookup_status = self._update_lastInfo(data)
+        if data is None or self._last_lookup_status:
             return None
-        if 'user' not in data['user']:
-            return None
-        if 'id' not in data['user']['user']:
-            return None
-
-        return str(data['user']['user']['id'])
+        return self.lastInfo.get('model', {}).get('username')
 
     def getStatus(self):
         data = self._getStatusData(self.username)
@@ -283,6 +333,9 @@ class StripChat(RoomIdBot):
         error = self._update_lastInfo(data)
         if error:
             return error
+
+        if self.room_id is None and self.lastInfo['model'].get('id') is not None:
+            self.room_id = str(self.lastInfo['model']['id'])
 
         if 'user' in data and 'user' in data['user']:
             model_data = data['user']['user']
@@ -319,6 +372,8 @@ class StripChat(RoomIdBot):
                 continue
             if streamer.room_id:
                 model_ids[streamer.room_id] = streamer
+            elif monotonic() >= streamer._next_status_lookup_at:
+                streamer.setStatus(streamer.getStatus())
 
         base_url = 'https://stripchat.com/api/front/models/list?'
         batch_num = 100
